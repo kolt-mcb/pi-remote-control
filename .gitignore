@@ -1,0 +1,19 @@
+# Build
+*/build/
+*/app/build/
+.gradle/
+local.properties
+build/
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
