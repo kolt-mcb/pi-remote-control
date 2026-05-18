@@ -48,11 +48,30 @@ function bcast(obj: Record<string, unknown>): void {
 // ── Server lifecycle ────────────────────────────────────────────────────
 
 function start(pi: ExtensionAPI): void {
-  if (wss) return;
+  if (wss) {
+    pi.sendMessage({
+      customType: "remote",
+      content: `already running: ws://${localIP()}:${DEFAULT_PORT}  (${clients.size} clients)`,
+      display: true,
+    });
+    return;
+  }
   const ip = localIP();
   const url = `ws://${ip}:${DEFAULT_PORT}`;
 
-  wss = new WebSocketServer({ port: DEFAULT_PORT, host: "0.0.0.0" });
+  try {
+    wss = new WebSocketServer({ port: DEFAULT_PORT, host: "0.0.0.0" });
+  } catch (err: any) {
+    if (err?.code === "EADDRINUSE") {
+      pi.sendMessage({
+        customType: "remote",
+        content: `port ${DEFAULT_PORT} in use by another session — connect at ${url}`,
+        display: true,
+      });
+      return;
+    }
+    throw err;
+  }
 
   console.log(`\n┌─ Pi Remote Control ─────────────────────────┐`);
   console.log(`│  ${url}  │`);
