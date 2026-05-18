@@ -59,19 +59,22 @@ function start(pi: ExtensionAPI): void {
   const ip = localIP();
   const url = `ws://${ip}:${DEFAULT_PORT}`;
 
-  try {
-    wss = new WebSocketServer({ port: DEFAULT_PORT, host: "0.0.0.0" });
-  } catch (err: any) {
+  wss = new WebSocketServer({ port: DEFAULT_PORT, host: "0.0.0.0" });
+
+  // ws emits EADDRINUSE asynchronously
+  wss.on("error", (err: any) => {
     if (err?.code === "EADDRINUSE") {
+      wss = null;
       pi.sendMessage({
         customType: "remote",
-        content: `port ${DEFAULT_PORT} in use by another session — connect at ${url}`,
+        content: `⚠ port ${DEFAULT_PORT} in use by another Pi — connect at ${url}`,
         display: true,
       });
       return;
     }
+    wss = null;
     throw err;
-  }
+  });
 
   console.log(`\n┌─ Pi Remote Control ─────────────────────────┐`);
   console.log(`│  ${url}  │`);
