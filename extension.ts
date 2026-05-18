@@ -61,7 +61,7 @@ function start(pi: ExtensionAPI): void {
 
   wss = new WebSocketServer({ port: DEFAULT_PORT, host: "0.0.0.0" });
 
-  // ws emits EADDRINUSE asynchronously
+  // ws emits EADDRINUSE asynchronously — before we can finish setup
   wss.on("error", (err: any) => {
     if (err?.code === "EADDRINUSE") {
       wss = null;
@@ -70,10 +70,8 @@ function start(pi: ExtensionAPI): void {
         content: `⚠ port ${DEFAULT_PORT} in use by another Pi — connect at ${url}`,
         display: true,
       });
-      return;
     }
-    wss = null;
-    throw err;
+    // any other ws error — ignore, 'connection' handles per-client errors
   });
 
   console.log(`\n┌─ Pi Remote Control ─────────────────────────┐`);
