@@ -247,12 +247,15 @@ Allow `wss://` URLs. OkHttp handles TLS automatically — just allow the scheme.
 - `msgUpd` converts thinking text to `Thinking` ChatMessage on `thinking_end`
 - UI shows collapsible "🤔 Thought" bubble with tap to expand
 
-### Phase 2 ✅ — Steer / Follow-up
-- `sendSteer()`, `sendFollowUp()` in PiWebSocket + ChatViewModel
-- `busy` state: `agent_start` → `agent_end`
+---
+
+### Phase 2 ✅ — Steer / Follow-up — VERIFIED (2026-05-18)
+- `sendSteer()`, `sendFollowUp()` in PiWebSocket → WebSocket sends `{"type":"steer|follow_up","message":"..."}`
+- Extension.ts handles both types: `steer` → `deliverAs: "steer"`, `follow_up` → `deliverAs: "follow_up"`
+- `busy` state: `agent_start` → `_busy.value = true`, `agent_end` → `_busy.value = false`
 - Header shows purple "thinking..." when busy
-- Filter chips for Steer (when busy) and Follow-up (when idle + messages)
-- Send button adapts: prompt → steer → follow-up
+- Input area adapts: send button, filter chips for Steer (when busy) and Follow-up (when idle + hasMessages)
+- Steer mode icon in input: 🔧 Tune icon / Follow-up: ↩ Send icon
 
 ### Phase 4a ✅ — Remember last URL  
 - DataStore preferences `last_server_url`
@@ -308,3 +311,53 @@ Tool outputs containing source code now render with syntax highlighting, line nu
 - `CodeBlock()` — numbered lines (up to 50), monospace font
 - `AnnotatedDirectedLine()` — lightweight syntax coloring: keywords (red), strings (blue), comments (gray)
 - ToolBubble shows 📄 icon, file path, line count for code
+
+---
+
+### Phase 5f ✅ — Timestamps on all message bubbles (2026-05-18)
+- Added `timestamp: Long = System.currentTimeMillis()` to `ChatMessage`
+- `ChatMessageEntity` already had `timestamp` — now persisted and loaded correctly
+- `formatTs(ts: Long)` helper in Screens.kt formats `Long` → `"h:mm a"`
+- All four bubble types show real timestamps:
+  - `UserBubble` — bottom-right of bubble (white, 50% alpha)
+  - `AssistantBubble` — below text (muted)
+  - `ThinkingBubble` — in header row (purple tint)
+  - `ToolBubble` — in header row (muted)
+
+### Phase 6a ✅ — Foreground service with foreground notification — VERIFIED LIVE (2026-05-18)
+
+**Verified on device: `isForeground=true startForegroundCount=1 flags=FOREGROUND_SERVICE`**
+
+**AndroidManifest.xml** — 3 declarations:
+- `android:foregroundServiceType="dataSync"` on `<service>`
+- `FOREGROUND_SERVICE` + `FOREGROUND_SERVICE_DATA_SYNC` permissions
+- `POST_NOTIFICATIONS` permission (requested at runtime on API 33+)
+
+**PiService.kt** — ForegroundService with dataSync type:
+- `onCreate()` → creates NotificationChannel (IMPORTANCE_LOW, "Pi Connection")
+- `onStartCommand()` → `startForeground(1001, notification)`, returns `START_STICKY`
+- **Notification**: title="Pi Remote — Connected", text="Connected to 192.168.1.128", subtext dynamically updates:
+  - "Thinking..." when agent busy
+  - "N messages" when idle with messages  
+  - "Connected" default
+  - `ONGOING` + `FOREGROUND_SERVICE` flags (can't be swiped away)
+  - Tapping opens the app (PendingIntent to MainActivity)
+- `onDestroy()` → `stopForeground(STOP_FOREGROUND_REMOVE)` removes notification
+- Companion object: `start(context, host, busy, msgCount)` / `stop(context)`
+
+**ChatViewModel.kt** — Service orchestration in `connect()`:
+- Collect `_ws.statusFlow` → start service on `Connected`, stop on `Disconnected | Error`
+- `combine(busyFlow, messageFlow)` → reactive notification updates while agent works in background
+
+**MainActivity.kt** — Critical fix:
+- ~~`ON_STOP -> ws.disconnect()`~~ **REMOVED** — was killing connection when app backgrounded
+- Now: OkHttp WS thread survives backgrounding, foreground service raises process priority
+- `ON_RESUME -> if (Disconnected && url) { vm.connect() }` — reconnects if connection died
+- Request `POST_NOTIFICATIONS` at runtime via `ActivityResultContracts.RequestPermission`
+
+**Survival chain** (how the app avoids being killed):
+1. Foreground service = higher process priority → OS won't kill for routine memory pressure
+2. `START_STICKY` → OS restarts service if it does kill it (new service instance)
+3. OkHttp dispatcher thread → WS connection survives Activity STOP
+4. Auto-reconnect in `onFailure()` → up to 10 retries, exponential backoff (2s→4s→8s→16s→32s cap)
+5. `PendingUrl` persists until user explicitly disconnects → always reconnectable
