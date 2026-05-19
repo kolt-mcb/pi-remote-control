@@ -5,7 +5,7 @@
  * No separate server process needed.
  *
  * Usage:
- *   pi -e ~/pi-remote-control/extension.ts
+  pi -e ~/pi-remote-control/extension.ts
  *
  * Then in pi:
  *   /remote-control   — starts the WS server
@@ -16,15 +16,34 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { WebSocketServer, WebSocket } from "ws";
 import type { RawData } from "ws";
 import os from "node:os";
+import { randomUUID } from "node:crypto";
 
 // ── Config ──────────────────────────────────────────────────────────────
 
 const DEFAULT_PORT = 8765;
 
+// ── Session types ───────────────────────────────────────────────────────
+
+interface RemoteSession {
+  id: string;
+  name: string;
+  status: "idle" | "busy" | "error";
+  connectedAt: number;
+  lastActivity: number;
+  messageCount: number;
+  turnIndex: number;
+}
+
 // ── State ───────────────────────────────────────────────────────────────
 
 let wss: WebSocketServer | null = null;
 const clients = new Set<WebSocket>();
+const sessions = new Map<string, RemoteSession>();
+
+// Global agent state (shared across all clients since Pi has one agent)
+let globalBusy = false;
+let globalMessageCount = 0;
+let globalTurnIndex = 0;
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -45,6 +64,44 @@ function bcast(obj: Record<string, unknown>): void {
   }
 }
 
+function buildSessionList(): RemoteSession[] {
+  const now = Date.now();
+  const list: RemoteSession[] = [];
+  for (const [, sess] of sessions) {
+    list.push({ ...sess, status: globalBusy ? "busy" : sess.status === "error" ? "error" : "idle" });
+  }
+  return list;
+}
+
+function bcastSessionList(ws?: WebSocket): void {
+  const list = buildSessionList();
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ type: "session_list", sessions: list }));
+  } else if (!ws) {
+    bcast({ type: "session_list", sessions: list });
+  }
+}
+
+function createSession(ws: WebSocket): string {
+  const id = randomUUID().slice(0, 8);
+  const name = (ws.url || "/").includes("name=")
+    ? new URLSearchParams(new URL(ws.url || "/", "ws://x").search).get("name") || `Client ${id}`
+    : `Client ${id}`;
+  const now = Date.now();
+  sessions.set(id, {
+    id,
+    name,
+    status: "idle",
+    connectedAt: now,
+    lastActivity: now,
+    messageCount: 0,
+    turnIndex: 0,
+  });
+  // Attach sessionId to ws for lookup
+  (ws as any).piRemoteSessionId = id;
+  return id;
+}
+
 // ── Server lifecycle ────────────────────────────────────────────────────
 
 function start(pi: ExtensionAPI): void {
@@ -61,7 +118,7 @@ function start(pi: ExtensionAPI): void {
 
   wss = new WebSocketServer({ port: DEFAULT_PORT, host: "0.0.0.0" });
 
-  // ws emits EADDRINUSE asynchronously — before we can finish setup
+  // WS emits EADDRINUSE asynchronously
   wss.on("error", (err: any) => {
     if (err?.code === "EADDRINUSE") {
       wss = null;
@@ -71,7 +128,6 @@ function start(pi: ExtensionAPI): void {
         display: true,
       });
     }
-    // any other ws error — ignore, 'connection' handles per-client errors
   });
 
   console.log(`\n┌─ Pi Remote Control ─────────────────────────┐`);
@@ -80,25 +136,34 @@ function start(pi: ExtensionAPI): void {
 
   wss.on("connection", (ws: WebSocket) => {
     clients.add(ws);
-    console.log(`  [+] ${clients.size} clinet(s)`);
+    const id = createSession(ws);
+    console.log(`  [+] ${sessions.size} session(s) — ${id} (${(ws as any).piRemoteSessionName || "?"})`);
+
+    // Send session_list immediately on connect
     bcast({ type: "connected", clients: clients.size });
+    bcastSessionList();
 
     ws.on("message", (data: RawData) => {
       const text = data.toString();
       try {
         const cmd = JSON.parse(text) as Record<string, unknown>;
-        handleCmd(cmd, pi);
+        handleCmd(cmd, pi, ws);
       } catch {
         ws.send(JSON.stringify({ type: "error", error: "Bad JSON" }));
       }
     });
 
     ws.on("close", () => {
+      (ws as any).piRemoteSessionId && sessions.delete((ws as any).piRemoteSessionId);
       clients.delete(ws);
-      console.log(`  [-] ${clients.size} client(s)`);
+      console.log(`  [-] ${sessions.size} session(s)`);
+      bcastSessionList();
     });
 
-    ws.on("error", () => clients.delete(ws));
+    ws.on("error", () => {
+      (ws as any).piRemoteSessionId && sessions.delete((ws as any).piRemoteSessionId);
+      clients.delete(ws);
+    });
   });
 
   pi.sendMessage({
@@ -111,6 +176,11 @@ function start(pi: ExtensionAPI): void {
 function stop(pi: ExtensionAPI): void {
   if (!wss) return;
   wss.close();
+  for (const ws of clients) {
+    ws.close();
+  }
+  clients.clear();
+  sessions.clear();
   wss = null;
   pi.sendMessage({
     customType: "remote",
@@ -121,7 +191,7 @@ function stop(pi: ExtensionAPI): void {
 
 // ── Inbound commands from phone ─────────────────────────────────────────
 
-function handleCmd(cmd: Record<string, unknown>, pi: ExtensionAPI): void {
+function handleCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws?: WebSocket): void {
   switch (cmd.type as string) {
     case "prompt": {
       const msg = cmd.message as string;
@@ -145,6 +215,16 @@ function handleCmd(cmd: Record<string, unknown>, pi: ExtensionAPI): void {
         success: true,
         data: { clients: clients.size, connected: clients.size > 0 },
       });
+      break;
+    }
+    case "get_sessions": {
+      // Reply only to requesting client
+      if (ws && ws.readyState === 1) {
+        ws.send(JSON.stringify({
+          type: "session_list",
+          sessions: buildSessionList(),
+        }));
+      }
       break;
     }
   }
@@ -176,17 +256,35 @@ export default function (pi: ExtensionAPI) {
   // ── Agent events ─────────────────────────────────────────────────────
 
   pi.on("agent_start", async (_e) => {
+    globalBusy = true;
+    // Update session status
+    for (const [, sess] of sessions) {
+      sess.status = "busy";
+      sess.lastActivity = Date.now();
+      sess.turnIndex = globalTurnIndex;
+    }
     bcast({ type: "agent_start" });
+    bcastSessionList();
   });
 
   pi.on("agent_end", async (e) => {
+    globalBusy = false;
+    globalMessageCount = (e.messages ?? []).length;
+    // Update session status
+    for (const [, sess] of sessions) {
+      sess.status = "idle";
+      sess.lastActivity = Date.now();
+      sess.messageCount = globalMessageCount;
+    }
     bcast({
       type: "agent_end",
-      messageCount: (e.messages ?? []).length,
+      messageCount: globalMessageCount,
     });
+    bcastSessionList();
   });
 
   pi.on("turn_start", async (e) => {
+    globalTurnIndex = e.turnIndex;
     bcast({ type: "turn_start", turnIndex: e.turnIndex });
   });
 
@@ -205,7 +303,6 @@ export default function (pi: ExtensionAPI) {
     bcast({ type: "message_end", message: e.message });
   });
 
-  // Need to grab the event type more carefully
   pi.on("message_update", async (e: any) => {
     const evt = e.assistantMessageEvent;
     if (!evt) return;
