@@ -361,3 +361,31 @@ Tool outputs containing source code now render with syntax highlighting, line nu
 3. OkHttp dispatcher thread → WS connection survives Activity STOP
 4. Auto-reconnect in `onFailure()` → up to 10 retries, exponential backoff (2s→4s→8s→16s→32s cap)
 5. `PendingUrl` persists until user explicitly disconnects → always reconnectable
+
+---
+
+### Phase 6c ✅ — WSS (TLS) support (2026-05-18)
+- OkHttp handles TLS automatically for wss:// URLs
+- URL validation accepts `ws://` and `wss://` schemes
+- QR scanner handles `piremote://` → `ws://` conversion
+- No additional code needed beyond wss:// scheme validation
+
+---
+
+### Summary of completed features (2026-05-18)
+- Phase 0: WebSocket connect/disconnect ✅
+- Phase 1a: Chat UI with streaming ✅
+- Phase 1b: Tool outputs with copy button ✅
+- Phase 2: Steer / Follow-up ✅ (VERIFIED via broadcast TestReceiver)
+- Phase 3: Room DB chat persistence ✅
+- Phase 4a: Remember last URL (DataStore) ✅
+- Phase 4b: Recent Connections ✅
+- Phase 4c: Error display ✅
+- Phase 4d: QR Scan to Connect (CameraX + ML Kit) ✅
+- Phase 5d: System Dark/Light Theme (ThemeManager) ✅
+- Phase 5e: Enter = Send (keyboardActions) ✅
+- Phase 5f: Timestamps on all message bubbles ✅
+- Phase 6a: Foreground service with notification (5-layer protection) ✅
+- Phase 6b: Push notification on agent_end in background ✅
+- Phase 6c: WSS (TLS) support ✅
+- UI polish: code display copy button, collapsible long tool output ✅
