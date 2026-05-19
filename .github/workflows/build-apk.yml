@@ -10,6 +10,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     defaults:
       run:
         working-directory: android/pi-remote-control-app
@@ -38,10 +40,15 @@ jobs:
       - name: Build debug APK
         run: ./gradlew assembleDebug --no-daemon --stacktrace
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
+      - name: Publish to "latest" release
+        if: github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
         with:
-          name: app-debug-apk
-          path: android/pi-remote-control-app/app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
-          retention-days: 14
+          tag_name: latest
+          name: Latest build
+          body: |
+            Auto-built debug APK from commit ${{ github.sha }}.
+            Triggered by ${{ github.event_name }} on ${{ github.ref_name }}.
+          prerelease: true
+          make_latest: "false"
+          files: android/pi-remote-control-app/app/build/outputs/apk/debug/app-debug.apk
