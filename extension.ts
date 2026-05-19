@@ -5,7 +5,7 @@
  * No separate server process needed.
  *
  * Usage:
-  pi -e ~/pi-remote-control/extension.ts
+ *   pi -e ~/pi-remote-control/extension.ts
  *
  * Then in pi:
  *   /remote-control   — starts the WS server
@@ -15,6 +15,7 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { WebSocketServer, WebSocket } from "ws";
 import type { RawData } from "ws";
+import type { IncomingMessage } from "node:http";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
 
@@ -39,6 +40,7 @@ interface RemoteSession {
 let wss: WebSocketServer | null = null;
 const clients = new Set<WebSocket>();
 const sessions = new Map<string, RemoteSession>();
+const wsToSessionId = new WeakMap<WebSocket, string>();
 
 // Global agent state (shared across all clients since Pi has one agent)
 let globalBusy = false;
@@ -65,7 +67,6 @@ function bcast(obj: Record<string, unknown>): void {
 }
 
 function buildSessionList(): RemoteSession[] {
-  const now = Date.now();
   const list: RemoteSession[] = [];
   for (const [, sess] of sessions) {
     list.push({ ...sess, status: globalBusy ? "busy" : sess.status === "error" ? "error" : "idle" });
@@ -82,11 +83,18 @@ function bcastSessionList(ws?: WebSocket): void {
   }
 }
 
-function createSession(ws: WebSocket): string {
+function parseNameFromUrl(reqUrl: string | undefined, fallback: string): string {
+  if (!reqUrl) return fallback;
+  try {
+    return new URL(reqUrl, "ws://x").searchParams.get("name") || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function createSession(ws: WebSocket, req: IncomingMessage): string {
   const id = randomUUID().slice(0, 8);
-  const name = (ws.url || "/").includes("name=")
-    ? new URLSearchParams(new URL(ws.url || "/", "ws://x").search).get("name") || `Client ${id}`
-    : `Client ${id}`;
+  const name = parseNameFromUrl(req.url, `Client ${id}`);
   const now = Date.now();
   sessions.set(id, {
     id,
@@ -97,8 +105,7 @@ function createSession(ws: WebSocket): string {
     messageCount: 0,
     turnIndex: 0,
   });
-  // Attach sessionId to ws for lookup
-  (ws as any).piRemoteSessionId = id;
+  wsToSessionId.set(ws, id);
   return id;
 }
 
@@ -118,7 +125,7 @@ function start(pi: ExtensionAPI): void {
 
   wss = new WebSocketServer({ port: DEFAULT_PORT, host: "0.0.0.0" });
 
-  // WS emits EADDRINUSE asynchronously
+  // ws emits EADDRINUSE asynchronously — before we can finish setup
   wss.on("error", (err: any) => {
     if (err?.code === "EADDRINUSE") {
       wss = null;
@@ -128,18 +135,18 @@ function start(pi: ExtensionAPI): void {
         display: true,
       });
     }
+    // any other ws error — ignore, 'connection' handles per-client errors
   });
 
   console.log(`\n┌─ Pi Remote Control ─────────────────────────┐`);
   console.log(`│  ${url}  │`);
   console.log(`└─────────────────────────────────────────────┘\n`);
 
-  wss.on("connection", (ws: WebSocket) => {
+  wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
     clients.add(ws);
-    const id = createSession(ws);
-    console.log(`  [+] ${sessions.size} session(s) — ${id} (${(ws as any).piRemoteSessionName || "?"})`);
+    const id = createSession(ws, req);
+    console.log(`  [+] ${sessions.size} session(s) — ${id} (${sessions.get(id)?.name ?? "?"})`);
 
-    // Send session_list immediately on connect
     bcast({ type: "connected", clients: clients.size });
     bcastSessionList();
 
@@ -153,17 +160,22 @@ function start(pi: ExtensionAPI): void {
       }
     });
 
-    ws.on("close", () => {
-      (ws as any).piRemoteSessionId && sessions.delete((ws as any).piRemoteSessionId);
+    const dropSession = () => {
+      const sid = wsToSessionId.get(ws);
+      if (sid) {
+        sessions.delete(sid);
+        wsToSessionId.delete(ws);
+      }
       clients.delete(ws);
+    };
+
+    ws.on("close", () => {
+      dropSession();
       console.log(`  [-] ${sessions.size} session(s)`);
       bcastSessionList();
     });
 
-    ws.on("error", () => {
-      (ws as any).piRemoteSessionId && sessions.delete((ws as any).piRemoteSessionId);
-      clients.delete(ws);
-    });
+    ws.on("error", dropSession);
   });
 
   pi.sendMessage({
@@ -181,6 +193,9 @@ function stop(pi: ExtensionAPI): void {
   }
   clients.clear();
   sessions.clear();
+  globalBusy = false;
+  globalMessageCount = 0;
+  globalTurnIndex = 0;
   wss = null;
   pi.sendMessage({
     customType: "remote",
@@ -218,13 +233,7 @@ function handleCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws?: WebSocke
       break;
     }
     case "get_sessions": {
-      // Reply only to requesting client
-      if (ws && ws.readyState === 1) {
-        ws.send(JSON.stringify({
-          type: "session_list",
-          sessions: buildSessionList(),
-        }));
-      }
+      if (ws) bcastSessionList(ws);
       break;
     }
   }
