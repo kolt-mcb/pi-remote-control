@@ -119,6 +119,20 @@ function hostBcastSessionList(only?: WebSocket): void {
   }
 }
 
+function buildCommandList(pi: ExtensionAPI): { name: string; description: string }[] {
+  try {
+    const cmds = (pi as { getCommands?: () => Array<{ name: string; description?: string }> }).getCommands?.() ?? [];
+    return cmds.map((c) => ({ name: c.name, description: c.description ?? "" }));
+  } catch {
+    return [];
+  }
+}
+
+function sendCommandList(pi: ExtensionAPI, ws: WebSocket): void {
+  if (ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: "command_list", commands: buildCommandList(pi) }));
+}
+
 /**
  * Emit an agent event:
  *  - host mode: stamp with SELF_AGENT_ID and broadcast to all Android clients
@@ -187,6 +201,7 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
 
     hostBcastClients(JSON.stringify({ type: "connected", clients: clientConns.size }));
     hostBcastSessionList();
+    sendCommandList(pi, ws);
 
     ws.on("message", (data: RawData) => {
       const text = data.toString();
@@ -433,6 +448,10 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
     }
     case "get_sessions": {
       hostBcastSessionList(ws);
+      break;
+    }
+    case "get_commands": {
+      sendCommandList(pi, ws);
       break;
     }
   }
