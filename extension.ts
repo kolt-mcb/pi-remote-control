@@ -23,6 +23,15 @@ import type { RawData } from "ws";
 import type { IncomingMessage } from "node:http";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
+// Local fork of pi-tui exposes selectListEvents/respondToSelectList so we can
+// surface any SelectList-based selector (built-in or extension) to the phone.
+import { selectListEvents, respondToSelectList } from "@earendil-works/pi-tui";
+// Local fork of pi-coding-agent re-exports BUILTIN_SLASH_COMMANDS so the phone
+// can offer the full catalogue (/resume, /model, /theme, …) instead of just the
+// extension/skill/template subset that pi.getCommands() returns.
+import { BUILTIN_SLASH_COMMANDS, SessionManager } from "@mariozechner/pi-coding-agent";
+import type { SessionInfo } from "@mariozechner/pi-coding-agent";
+import qrcodeTerminal from "qrcode-terminal";
 
 // ── Config ──────────────────────────────────────────────────────────────
 
@@ -62,6 +71,118 @@ const agents = new Map<string, AgentSession>(); // includes self + peers
 // Peer-mode state
 let peerSock: WebSocket | null = null;
 let peerReconnectTimer: NodeJS.Timeout | null = null;
+
+// Cross-extension bridge (globalThis): ANY extension can push TUI frames
+// to connected Android clients and register for remote input. Usage:
+//
+//   // In your extension's ctx.ui.custom callback:
+//   const piRemote = (globalThis as any).__piRemote;
+//   if (piRemote) {
+//     piRemote.render({ id: "myTui", lines: [...], inputMode: "keys", title: "My Game" });
+//   }
+//   // To handle remote input:
+//   const unsub = piRemote.onInput((id, value) => { ... });
+//   // When done:
+//   piRemote.render({ id: "myTui", lines: [], dismiss: true });
+//   unsub();
+(globalThis as any).__piRemote = {
+  /**
+   * Push a TUI render frame to all connected Android clients.
+   * Call every frame from your game/render loop.
+   * @param frame  { id, lines: string[], inputMode: "keys"|"text"|"none", title?: string }
+   *               Use `lines: []` or `dismiss: true` to clear the frame on Android.
+   */
+  render: (frame: { id: string; lines: string[]; inputMode?: string; title?: string; dismiss?: boolean }) => {
+    hostBcastClients(JSON.stringify({
+      type: "render",
+      id: frame.id,
+      lines: frame.lines,
+      inputMode: frame.inputMode ?? "none",
+      title: frame.title ?? "",
+      dismiss: frame.dismiss || frame.lines.length === 0,
+    }));
+  },
+  /**
+   * Register a callback for remote TUI input (e.g., D-pad taps from Android).
+   * Returns an unsubscribe function.
+   */
+  onInput: (cb: (id: string, value: string) => void) => {
+    inputListeners.push(cb);
+    return () => { const i = inputListeners.indexOf(cb); if (i !== -1) inputListeners.splice(i, 1); };
+  },
+  /** Get connected Android client count */
+  get clientCount() { return clientConns.size; },
+  /** Is the remote-control server running? */
+  get isRunning() { return mode === "host"; },
+};
+
+// Collects callbacks registered via onInput()
+const inputListeners: Array<(id: string, value: string) => void> = [];
+
+// Bridge pi-tui SelectList lifecycle to the phone. Any selector that uses
+// SelectList under the hood (themes, thinking levels, settings, show-images,
+// plus anything an extension builds with it) shows up as a native dialog on
+// the phone via the existing extension_ui_request protocol.
+// Map labels back to values when the phone sends a string response.
+const liveSelectListLabels = new Map<string, Map<string, string>>();
+selectListEvents.on("mount", (e: { id: string; items: Array<{ value: string; label: string; description?: string }> }) => {
+  const labelToValue = new Map<string, string>();
+  for (const it of e.items) labelToValue.set(it.label || it.value, it.value);
+  liveSelectListLabels.set(e.id, labelToValue);
+  hostBcastClients(JSON.stringify({
+    type: "extension_ui_request",
+    method: "select",
+    id: e.id,
+    title: "Select",
+    options: e.items.map((it) => it.label || it.value),
+  }));
+});
+selectListEvents.on("dismiss", (e: { id: string }) => {
+  liveSelectListLabels.delete(e.id);
+  hostBcastClients(JSON.stringify({ type: "extension_ui_dismiss", id: e.id }));
+});
+
+// ── Remote-only select dialogs ─────────────────────────────────────────
+// For built-in slash commands like /resume that have rich local TUI selectors
+// we can't cleanly remote, the extension synthesises a flat select-from-list
+// dialog on the phone using extension_ui_request. Each pending dialog is
+// tracked here so the response can be routed back to the right handler.
+// Ids use the "rmt_" prefix to distinguish from SelectList-bridged "sl_" ids.
+type RemoteSelectPending = {
+  labelToValue: Map<string, string>;
+  onPick: (value: string) => void;
+  onCancel: () => void;
+};
+const remoteSelects = new Map<string, RemoteSelectPending>();
+let remoteSelectIdCounter = 0;
+
+function showRemoteSelect(opts: {
+  title: string;
+  options: Array<{ label: string; value: string }>;
+  onPick: (value: string) => void;
+  onCancel?: () => void;
+}): void {
+  if (opts.options.length === 0) {
+    opts.onCancel?.();
+    return;
+  }
+  remoteSelectIdCounter++;
+  const id = `rmt_${Date.now().toString(36)}_${remoteSelectIdCounter.toString(36)}`;
+  const labelToValue = new Map<string, string>();
+  for (const o of opts.options) labelToValue.set(o.label, o.value);
+  remoteSelects.set(id, {
+    labelToValue,
+    onPick: opts.onPick,
+    onCancel: opts.onCancel ?? (() => { /* noop */ }),
+  });
+  hostBcastClients(JSON.stringify({
+    type: "extension_ui_request",
+    method: "select",
+    id,
+    title: opts.title,
+    options: opts.options.map((o) => o.label),
+  }));
+}
 
 // Local agent state (this pi's own agent — applies in both host and peer mode)
 let localBusy = false;
@@ -119,13 +240,93 @@ function hostBcastSessionList(only?: WebSocket): void {
   }
 }
 
+// ── Remote slash-command support ────────────────────────────────────────
+// Commands the phone can execute remotely via `withCommandContext`.
+// Commands NOT listed here are UI-heavy (settings menus, model selectors,
+// file pickers, clipboard) and can't be proxied through the extension API.
+const REMOTE_SUPPORTED_COMMANDS = new Set([
+  // Already handled: "resume"
+  "compact",    // ctx.compact()
+  "new",        // ctx.newSession()
+  "reload",     // ctx.reload()
+  "quit",       // ctx.shutdown()
+]);
+
+// Built-ins that require TUI-only UI → hide from phone's autocomplete.
+const REMOTE_UNSUPPORTED_BUILTINS = new Set(BUILTIN_SLASH_COMMANDS
+  .filter(b => !REMOTE_SUPPORTED_COMMANDS.has(b.name) && b.name !== "resume")
+  .map(b => b.name),
+);
+
+/** Send a notify banner to the phone explaining a command needs the host TUI */
+function notifyUnsupportedCommand(name: string): void {
+  hostBcastClients(JSON.stringify({
+    type: "extension_ui_request",
+    method: "notify",
+    id: "notify_unsupported_" + Date.now(),
+    message: `⚠ /${name} requires the host TUI. Type it directly in the Pi terminal.`,
+    notifyType: "warning",
+  }));
+}
+
 function buildCommandList(pi: ExtensionAPI): { name: string; description: string }[] {
+  const out: { name: string; description: string }[] = [];
+  // Built-ins first — but filter out ones that need TUI-only UI.
+  for (const b of BUILTIN_SLASH_COMMANDS) {
+    if (!REMOTE_UNSUPPORTED_BUILTINS.has(b.name)) {
+      out.push({ name: b.name, description: b.description });
+    }
+  }
+  // Extension/skill/template commands are fine — they expand via executeSlashCommands.
   try {
     const cmds = (pi as { getCommands?: () => Array<{ name: string; description?: string }> }).getCommands?.() ?? [];
-    return cmds.map((c) => ({ name: c.name, description: c.description ?? "" }));
-  } catch {
-    return [];
-  }
+    for (const c of cmds) out.push({ name: c.name, description: c.description ?? "" });
+  } catch { /* ignore */ }
+  return out;
+}
+
+// ── Remote handlers for built-in slash commands ────────────────────────
+//
+// These run when the phone sends "/foo" through `prompt` and the command is
+// a built-in that needs a UI selector (e.g., /resume). The handler returns
+// `true` if it claimed the command (extension already responded), `false` to
+// let the normal sendUserMessage path proceed (which would just ship the text
+// to the LLM — usually wrong for built-ins, hence the interception).
+
+function formatSessionLabel(s: SessionInfo): string {
+  const name = s.name?.trim() || s.firstMessage?.trim() || s.id;
+  const trimmed = name.length > 40 ? name.slice(0, 39) + "…" : name;
+  const date = new Date(s.modified).toISOString().slice(0, 10);
+  return `${trimmed} · ${s.messageCount} msgs · ${date}`;
+}
+
+function handleRemoteResume(pi: ExtensionAPI): boolean {
+  void (async () => {
+    let sessions: SessionInfo[] = [];
+    try {
+      sessions = await SessionManager.listAll();
+    } catch (e) {
+      console.error("[remote-control] list sessions failed:", e);
+      return;
+    }
+    // Show most-recent first; cap at a reasonable number for the dialog.
+    sessions.sort((a, b) => +new Date(b.modified) - +new Date(a.modified));
+    const truncated = sessions.slice(0, 100);
+    showRemoteSelect({
+      title: "Resume session",
+      options: truncated.map((s) => ({ label: formatSessionLabel(s), value: s.path })),
+      onPick: (sessionPath) => {
+        void pi.withCommandContext(async (ctx) => {
+          try {
+            await ctx.switchSession(sessionPath);
+          } catch (e) {
+            console.error("[remote-control] switchSession failed:", e);
+          }
+        });
+      },
+    });
+  })();
+  return true;
 }
 
 function sendCommandList(pi: ExtensionAPI, ws: WebSocket): void {
@@ -186,10 +387,16 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
     console.log(`\n┌─ Pi Remote Control (host) ──────────────────┐`);
     console.log(`│  ${url}  │`);
     console.log(`└─────────────────────────────────────────────┘\n`);
-    pi.sendMessage({
-      customType: "remote",
-      content: `active: ${url}  (host: ${SELF_AGENT_NAME})`,
-      display: true,
+    // Render a QR code the Android app can scan. The Android scanner accepts
+    // ws://, wss://, piremote://, and bare host:port; we use ws:// so a
+    // generic QR scanner (camera app) also recognises it as a URL.
+    qrcodeTerminal.generate(url, { small: true }, (qr: string) => {
+      console.log(qr);
+      pi.sendMessage({
+        customType: "remote",
+        content: `active: ${url}  (host: ${SELF_AGENT_NAME})\nScan with the Pi Remote app:\n${qr}`,
+        display: true,
+      });
     });
   });
 
@@ -422,18 +629,123 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
     case "steer":
     case "follow_up": {
       const msg = cmd.message as string;
-      if (!msg) break;
+      const images = (cmd.images as string[]) || [];
+      if (!msg && images.length === 0) break;
       const target = (cmd.targetAgentId as string) || SELF_AGENT_ID;
       const deliverAs =
         cmd.type === "steer" ? "steer" : cmd.type === "follow_up" ? "followUp" : undefined;
+      // Built-in slash commands need rich UI (session metadata, model scope tabs,
+      // tree nav) that ctx.ui.select can't represent without losing data. So for
+      // the most common UI-bearing built-ins we synthesise a flat tap-list on
+      // the phone and act on the pick ourselves, instead of forwarding the
+      // slash text to pi. Targets the local agent only; peer routing untouched.
+      if (target === SELF_AGENT_ID && cmd.type === "prompt") {
+        const cmdName = msg.split(/\s/)[0].slice(1);
+        if (cmdName === "resume" && handleRemoteResume(pi)) break;
+      }
       if (target === SELF_AGENT_ID) {
-        if (deliverAs) pi.sendUserMessage(msg, { deliverAs });
-        else pi.sendUserMessage(msg);
+        const sendOpts: { deliverAs?: "steer" | "followUp" } = {};
+        if (deliverAs) sendOpts.deliverAs = deliverAs;
+        // Pi's ImageContent is { type:"image", data, mimeType } — `data` is raw
+        // base64 without the data-URI prefix. Sending the full `data:...;base64,`
+        // URI yields "Non-base64 digit found" from Claude because `:`, `/`, `;`, `,`
+        // aren't valid base64 characters.
+        if (images.length > 0) {
+          type TextMsg = { type: "text"; text: string };
+          type ImageMsg = { type: "image"; data: string; mimeType: string };
+          const contentArr: Array<TextMsg | ImageMsg> = [];
+          if (msg) contentArr.push({ type: "text", text: msg });
+          for (const dataUri of images) {
+            const m = dataUri.match(/^data:([^;]+);base64,(.*)$/);
+            const mime = m ? m[1] : "image/jpeg";
+            const data = m ? m[2] : dataUri;
+            contentArr.push({ type: "image", data, mimeType: mime });
+          }
+          pi.sendUserMessage(contentArr, sendOpts);
+        } else {
+          pi.sendUserMessage(msg, sendOpts);
+        }
       } else {
         const peerWs = peerConns.get(target);
         if (peerWs && peerWs.readyState === 1) {
-          peerWs.send(JSON.stringify({ type: "route_prompt", message: msg, deliverAs }));
+          peerWs.send(JSON.stringify({ type: "route_prompt", message: msg, deliverAs, executeSlashCommands: msg.startsWith("/"), images }));
         }
+      }
+      break;
+    }
+    // ── Remote slash-command execution ───────────────────────────────────
+    // Handles /compact, /new, /reload, /quit via withCommandContext.
+    // /resume is handled separately above (has a rich session picker UI).
+    // Unsupported built-ins get a notify banner telling the user to use the host TUI.
+    case "slash_command": {
+      const commandName = (cmd.command as string)?.trim().toLowerCase();
+      if (!commandName) break;
+      const target = (cmd.targetAgentId as string) || SELF_AGENT_ID;
+      if (target !== SELF_AGENT_ID) break; // Only handle local agent
+
+      if (commandName === "compact") {
+        const instructions = (cmd.args as string)?.trim();
+        void (async () => {
+          await pi.withCommandContext(async (ctx) => {
+            ctx.compact(instructions ? { instructions } : undefined);
+          });
+          hostBcastClients(JSON.stringify({
+            type: "extension_ui_request",
+            method: "notify",
+            id: `notify_compact_${Date.now()}`,
+            message: instructions
+              ? `Compacting with custom instructions...`
+              : `Compacting session context...`,
+            notifyType: "info",
+          }));
+        })();
+      } else if (commandName === "new") {
+        void (async () => {
+          await pi.withCommandContext(async (ctx) => {
+            await ctx.newSession();
+          });
+          hostBcastClients(JSON.stringify({
+            type: "extension_ui_request",
+            method: "notify",
+            id: `notify_new_${Date.now()}`,
+            message: `New session started.`,
+            notifyType: "info",
+          }));
+        })();
+      } else if (commandName === "reload") {
+        void (async () => {
+          await pi.withCommandContext(async (ctx) => {
+            void ctx.reload();
+          });
+          hostBcastClients(JSON.stringify({
+            type: "extension_ui_request",
+            method: "notify",
+            id: `notify_reload_${Date.now()}`,
+            message: `Reloading Pi...`,
+            notifyType: "info",
+          }));
+        })();
+      } else if (commandName === "quit") {
+        void (async () => {
+          await pi.withCommandContext(async (ctx) => {
+            void ctx.shutdown();
+          });
+        })();
+      } else if (commandName === "resume" && handleRemoteResume(pi)) {
+        // /resume is handled by the existing remote session picker
+      } else {
+        // Unsupported built-in command — notify the phone
+        notifyUnsupportedCommand(commandName);
+      }
+      break;
+    }
+    case "input": {
+      // Forward TUI key input to any listening extension via onInput callback
+      const id = (cmd.id as string) || "";
+      const value = (cmd.value as string) || "";
+      if (value) {
+        // Deliver to all registered input listeners (generic — no extension coupling)
+        for (const cb of inputListeners) cb(id, value);
       }
       break;
     }
@@ -454,6 +766,35 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
       sendCommandList(pi, ws);
       break;
     }
+    case "extension_ui_response": {
+      const id = (cmd.id as string) || "";
+      const cancelled = cmd.cancelled === true;
+      const label = (cmd.value as string) ?? "";
+      if (id.startsWith("sl_")) {
+        // SelectList bridge: forward to pi-tui's responder so the live local
+        // TUI selector also dismisses.
+        if (cancelled) {
+          respondToSelectList(id, null);
+        } else {
+          // We sent labels to the phone; translate back to the SelectItem value.
+          const value = liveSelectListLabels.get(id)?.get(label) ?? label;
+          respondToSelectList(id, value);
+        }
+      } else if (id.startsWith("rmt_")) {
+        // Remote-only dialog (built-in command intercept). Route to the
+        // pending callback and clear.
+        const pending = remoteSelects.get(id);
+        if (!pending) break;
+        remoteSelects.delete(id);
+        if (cancelled) {
+          pending.onCancel();
+        } else {
+          const value = pending.labelToValue.get(label) ?? label;
+          pending.onPick(value);
+        }
+      }
+      break;
+    }
   }
 }
 
@@ -463,10 +804,29 @@ function handlePeerInbound(msg: Record<string, unknown>, pi: ExtensionAPI): void
   switch (msg.type as string) {
     case "route_prompt": {
       const text = msg.message as string;
-      if (!text) break;
+      const images = (msg.images as string[]) || [];
+      if (!text && images.length === 0) break;
       const deliverAs = msg.deliverAs as "steer" | "followUp" | undefined;
-      if (deliverAs) pi.sendUserMessage(text, { deliverAs });
-      else pi.sendUserMessage(text);
+      const executeSlashCommands = (msg.executeSlashCommands as boolean) ?? text.startsWith("/");
+      // Pi's ImageContent is { type:"image", data, mimeType } — `data` is raw
+      // base64 without the data-URI prefix. See SELF_AGENT_ID branch above.
+      const peerSendOpts: { deliverAs?: "steer" | "followUp" } = {};
+      if (deliverAs) peerSendOpts.deliverAs = deliverAs;
+      if (images.length > 0) {
+        type TextMsg = { type: "text"; text: string };
+        type ImageMsg = { type: "image"; data: string; mimeType: string };
+        const contentArr: Array<TextMsg | ImageMsg> = [];
+        if (text) contentArr.push({ type: "text", text });
+        for (const dataUri of images) {
+          const m = dataUri.match(/^data:([^;]+);base64,(.*)$/);
+          const mime = m ? m[1] : "image/jpeg";
+          const data = m ? m[2] : dataUri;
+          contentArr.push({ type: "image", data, mimeType: mime });
+        }
+        pi.sendUserMessage(contentArr, peerSendOpts);
+      } else {
+        pi.sendUserMessage(text, peerSendOpts);
+      }
       break;
     }
     // peer_ack and any other host->peer messages: ignored (no state to update)
@@ -524,6 +884,26 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("turn_end", async (e) => {
     emitAgentEvent({ type: "turn_end", turnIndex: e.turnIndex });
+  });
+
+  pi.on("compactionStart", async () => {
+    emitAgentEvent({ type: "compaction_start" });
+  });
+
+  pi.on("compactionEnd", async () => {
+    emitAgentEvent({ type: "compaction_end" });
+  });
+
+  pi.on("autoRetryStart", async (e: any) => {
+    emitAgentEvent({
+      type: "auto_retry_start",
+      attempt: e.attempt,
+      maxAttempts: e.maxAttempts,
+    });
+  });
+
+  pi.on("autoRetryEnd", async () => {
+    emitAgentEvent({ type: "auto_retry_end" });
   });
 
   // ── Message events ────────────────────────────────────────────────────
@@ -597,15 +977,111 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("tool_execution_end", async (e: any) => {
     const cr = e.result;
-    const content = Array.isArray(cr?.content)
-      ? cr.content.map((c: any) => c.text ?? "").join("")
-      : "";
+    // Extract content: try .text[] first, then .content[] (file read results)
+    let content = "";
+    if (Array.isArray(cr?.content)) {
+      content = cr.content.map((c: any) => c.text ?? c.content ?? "").join("\n");
+    } else if (typeof cr?.content === "string") {
+      content = cr.content;
+    }
+    // Also try flat text fields on the result
+    if (!content && typeof cr === "object") {
+      content = (cr.text as string) ?? (cr.output as string) ?? "";
+    }
     emitAgentEvent({
       type: "tool_end",
       toolCallId: e.toolCallId,
       toolName: e.toolName ?? "",
       content,
       isError: e.isError ?? false,
+    });
+  });
+
+  // ── Extension UI events ───────────────────────────────────────────────
+
+  pi.on("extensionUiRequested", async (e: any) => {
+    emitAgentEvent({
+      type: "extension_ui_request",
+      method: e.method,
+      id: e.id,
+      title: e.title,
+      message: e.message,
+      options: e.options,
+      placeholder: e.placeholder,
+      prefill: e.prefill,
+      timeout: e.timeout,
+    });
+  });
+
+  pi.on("extensionUiNotify", async (e: any) => {
+    emitAgentEvent({
+      type: "extension_ui_request",
+      method: "notify",
+      id: "notify_" + Date.now(),
+      message: e.message ?? e.content ?? "",
+      notifyType: e.type ?? "info",
+    });
+  });
+
+  pi.on("extensionUiStatus", async (e: any) => {
+    emitAgentEvent({
+      type: "extension_ui_request",
+      method: "setStatus",
+      id: "status",
+      statusKey: e.key ?? e.statusKey,
+      statusText: e.text ?? e.statusText ?? "",
+    });
+  });
+
+  pi.on("extensionUiWidget", async (e: any) => {
+    emitAgentEvent({
+      type: "extension_ui_request",
+      method: "setWidget",
+      id: "widget",
+      widgetKey: e.key ?? e.widgetKey,
+      widgetLines: e.lines ?? e.widgetLines ?? [],
+    });
+  });
+
+  // Game mode: extensionUiGameFrame → raw RGBA pixel data stream
+  // Sent as hex-encoded string to avoid binary WS compat issues
+  pi.on("extensionUiGameFrame", async (e: any) => {
+    if (e.data && e.width && e.height) {
+      const frame = e.data as Uint8Array;
+      emitAgentEvent({
+        type: "game_frame",
+        width: e.width,
+        height: e.height,
+        data: Buffer.from(frame.buffer).toString("hex"),
+      });
+    }
+  });
+
+  // Generic TUI render protocol: extensionUiRender → raw ANSI text
+  // Throttled to ~10fps (DOOM game loop runs at 35+ which would flood the WS)
+  let lastRenderBroadcast = 0;
+  const RENDER_THROTTLE_MS = 100; // throttle to ~10fps
+  // Any Pi extension can emit rendered terminal frames. Supports ANY TUI component.
+  pi.on("extensionUiRender", async (e: any) => {
+    const now = Date.now();
+    if (now - lastRenderBroadcast < RENDER_THROTTLE_MS) return;
+    lastRenderBroadcast = now;
+    emitAgentEvent({
+      type: "render",
+      id: e.id,
+      lines: e.lines,
+      inputMode: e.inputMode ?? "none",
+      title: e.title ?? "",
+    });
+  });
+
+
+  pi.on("extensionUiSetTitle", async (e: any) => {
+    emitAgentEvent({
+      type: "extension_ui_request",
+      method: "setTitle",
+      id: "title",
+      title: e.title ?? "",
     });
   });
 
@@ -616,6 +1092,14 @@ export default function (pi: ExtensionAPI) {
     wss = null;
     peerSock = null;
     mode = "stopped";
+    // Auto-start the WS server. The whole purpose of loading this extension
+    // is to expose the agent over LAN; making the user type /remote-control
+    // every launch is just friction. If the port is already bound by another
+    // pi on this host, start(pi) falls back to peer mode automatically.
+    // Set PI_REMOTE_CONTROL_NO_AUTOSTART=1 to skip and use /remote-control manually.
+    if (process.env.PI_REMOTE_CONTROL_NO_AUTOSTART !== "1") {
+      try { start(pi); } catch { /* ignore */ }
+    }
   });
 
   pi.on("session_shutdown", async () => {

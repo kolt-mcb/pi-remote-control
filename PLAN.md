@@ -1,5 +1,90 @@
 # Pi Remote Control — Implementation Plan
 
+## Latest Updates (2026-05-19)
+
+### UI Redesign — Pi Terminal Style ✅
+Complete visual overhaul to match the Pi CLI terminal aesthetic:
+
+**Design Language:**
+- Monospace font (`piMono = FontFamily.Monospace`) throughout all screens
+- Square/terminal borders replacing rounded Material3 corners (`RoundedCornerShape(0.dp)`)
+- Terminal-style box borders: `┌─ header ─┐ / │ body │ / └──────┘` using ASCII art box-drawing chars
+- Pi Terminal border colors: accent (blue) for selected/highlighted, thinking (purple) for active agent, success (green) for idle, error (red) for failures
+- Compact, dense layout — tight spacing, minimal padding
+- Footer bar with session status, agent count, connection count, message count
+
+**ConnectScreen (Menu Screen):**
+- `PiBox(header = "Pi Remote")` — bordered header block
+- `PiBox(header = "Options")` — terminal-style menu with `[1]`, `[2]`, `[3]` keys
+- URL input in a bordered `PiBox(header = "URL")` with accent border
+- Connection status as inline text: `● Connected` (green), `✕ Error` (red)
+- `[Connect]` terminal-style button (square border, centered)
+- `[Retry]` button for error states
+- Recent connections as `PiTerminalChip` components (square bordered text)
+- `PiBox(header = "Quick Start", borderColor = borderMuted)` — quick start guide
+
+**ChatScreen (Main Screen):**
+- `PiHeader(status, busy, title)` — header bar with status dot, title, `[Disconnect]` button
+- `PiSessionSelector` — terminal-style session tabs: boxed pills with `▸` selection indicator and colored status dots
+- `PiGutter` messages — left-border `│` prefix instead of chat bubbles
+  - `PiUserMessage`: `│ you 12:34 PM / │ message text`
+  - `PiAssistantMessage`: `│ pi 12:34 PM / │ response text`
+  - `PiThinkingMessage`: `│ thought ▼` (collapsible gray italic)
+- `PiBox(borderColor = boxBorderColor)` — tool result boxes with colored border
+- `PiCodeBlock` — numbered lines with syntax highlighting
+- `PiInputEditor` — bordered input with dynamic border color (thinking when busy, accent for follow-up)
+- `PiFooter(sessions, count)` — bottom footer bar with session info
+
+**UIExt.kt (Extension UI):**
+- `SelectDialog` — `[YES]`/`[NO]` buttons, `▸ option` items
+- `InputDialog` — `[editor]` tagged title, `[OK]`/`[CANCEL]` buttons
+- `NotifyBanner` — severity-colored borders
+- `PiWidgetPanel` — terminal-style box-drawing: `┌─ key ─┐ / │ content │ / └──────┘`
+- `PiStatusBarLine` — `├ status text ┤` with bottom border
+
+**Files changed:**
+- `theme/Color.kt` — Pi terminal color palette
+- `screens/Screens.kt` — Complete UI rewrite (41KB)
+- `screens/UIExt.kt` — Terminal-styled dialogs/banners
+
+**Build verified:** ✅ `./gradlew :app:assembleDebug` passes
+
+### Extension UI Forwarding ✅
+Added `extension_ui` event forwarding from extension.ts to WebSocket so Android can mirror all Pi CLI displays:
+
+**Extension.ts** — new `pi.on()` handlers:
+- `extensionUiRequested` → broadcasts `extension_ui_request` (select, confirm, input, editor dialogs)
+- `extensionUiNotify` → broadcasts notify → shows as colored banner (info/warning/error)  
+- `extensionUiStatus` → broadcasts `setStatus` → status bar line at top of chat
+- `extensionUiWidget` → broadcasts `setWidget` → widget panel content
+- `extensionUiSetTitle` → broadcasts `setTitle` → dynamic header title
+- `compactionStart`/`compactionEnd` → compaction progress banner
+- `autoRetryStart`/`autoRetryEnd` → retry attempt banner
+
+**Android PiWebSocket.kt** — new flows & fixes:
+- `BannerMessage` data class with `content`, `type`, `timestamp`
+- `_notifyBanners` flow → toasts/banners from Pi notifications
+- `_uiTitle` flow → dynamic app header title
+- `_clientCount` flow → connected client count
+- `connected` event handler (was missing)
+- `turn_start`/`turn_end` dispatch handlers (were missing)
+- Fixed `notify`: was no-op, now creates BannerMessage
+- Fixed `setTitle`: was handled in comment only, now stores value
+- Fixed `setStatus`: tolerant fallback for non-standard field names
+- Fixed `set_editor_text`: placeholder note for future
+
+**Android UiExt.kt** — improved NotifyBanner:
+- Colored borders matching severity (error → red, warning → orange, info → blue)
+- Dismiss button (Close icon)
+- Max 2 lines with truncation
+- Proper padding and spacing
+
+**Android ChatScreen** — new displays:
+- `notifyBanners.forEach { NotifyBanner(...) }` — shows Pi notifications inline
+- `uiTitle` displayed in header (falls back to "Pi Remote")
+
+**Verified:** ✅ `./gradlew :app:assembleDebug` passes
+
 ## Phase 0: Clean up debug code (blocking)
 
 Remove auto-connect + debug logging added for headless testing. The app should launch to the Connect screen for user input.

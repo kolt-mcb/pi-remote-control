@@ -9,16 +9,43 @@ const wss = new WebSocketServer({ port: PORT, host: '0.0.0.0' });
 console.log(`Mock Pi server listening on ws://0.0.0.0:${PORT}`);
 console.log('From emulator, connect to: ws://10.0.2.2:8765');
 
+const MOCK_SESSION = {
+  id: 'mock-self',
+  name: 'Mock-Pi',
+  kind: 'self',
+  status: 'idle',
+  connectedAt: Date.now(),
+  lastActivity: Date.now(),
+  messageCount: 0,
+  turnIndex: 0,
+};
+
+const MOCK_COMMANDS = [
+  { name: 'remote-control', description: 'Start remote control server' },
+  { name: 'remote-stop', description: 'Stop remote control server' },
+];
+
+function sendSessionList(ws) {
+  MOCK_SESSION.lastActivity = Date.now();
+  ws.send(JSON.stringify({ type: 'session_list', sessions: [MOCK_SESSION] }));
+}
+
+function sendCommandList(ws) {
+  ws.send(JSON.stringify({ type: 'command_list', commands: MOCK_COMMANDS }));
+}
+
 wss.on('connection', (ws) => {
   console.log('[+] Client connected');
-  
+
   ws.send(JSON.stringify({ type: 'connected', clients: wss.clients.size }));
-  
+  sendSessionList(ws);
+  sendCommandList(ws);
+
   ws.on('message', (data) => {
     try {
       const cmd = JSON.parse(data.toString());
       console.log('Received:', JSON.stringify(cmd));
-      
+
       switch (cmd.type) {
         case 'prompt':
           handlePrompt(ws, cmd.message);
@@ -28,6 +55,12 @@ wss.on('connection', (ws) => {
           break;
         case 'follow_up':
           handleFollowUp(ws, cmd.message);
+          break;
+        case 'get_sessions':
+          sendSessionList(ws);
+          break;
+        case 'get_commands':
+          sendCommandList(ws);
           break;
         case 'get_state':
           ws.send(JSON.stringify({
@@ -44,7 +77,7 @@ wss.on('connection', (ws) => {
       ws.send(JSON.stringify({ type: 'error', error: 'Bad JSON' }));
     }
   });
-  
+
   ws.on('close', () => console.log('[-] Client disconnected'));
 });
 
