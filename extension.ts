@@ -22,7 +22,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import type { RawData } from "ws";
 import type { IncomingMessage } from "node:http";
 import os from "node:os";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 // Local fork of pi-tui exposes selectListEvents/respondToSelectList so we can
 // surface any SelectList-based selector (built-in or extension) to the phone.
 import { selectListEvents, respondToSelectList } from "@earendil-works/pi-tui";
@@ -36,6 +36,31 @@ import qrcodeTerminal from "qrcode-terminal";
 // ── Config ──────────────────────────────────────────────────────────────
 
 const DEFAULT_PORT = 8765;
+
+// Optional shared-secret auth. If PI_REMOTE_TOKEN is set, every WS connection
+// must carry `?token=...` matching the env var; otherwise the connection is
+// closed with code 4001. Unset → no auth (preserves the original LAN-trust
+// behaviour for users who explicitly want it).
+const AUTH_TOKEN = process.env.PI_REMOTE_TOKEN ?? "";
+
+function authOk(provided: string): boolean {
+  if (!AUTH_TOKEN) return true;
+  // Length mismatch can't be timing-safe and isn't a meaningful secret; bail early.
+  if (provided.length !== AUTH_TOKEN.length) return false;
+  return timingSafeEqual(Buffer.from(provided), Buffer.from(AUTH_TOKEN));
+}
+
+function urlWithToken(base: string): string {
+  if (!AUTH_TOKEN) return base;
+  const sep = base.includes("?") ? "&" : "?";
+  return `${base}${sep}token=${encodeURIComponent(AUTH_TOKEN)}`;
+}
+
+function tokenFromReqUrl(reqUrl: string | undefined): string {
+  if (!reqUrl) return "";
+  try { return new URL(reqUrl, "ws://x").searchParams.get("token") ?? ""; }
+  catch { return ""; }
+}
 
 // ── Session types ───────────────────────────────────────────────────────
 
@@ -360,7 +385,7 @@ function parseNameFromUrl(reqUrl: string | undefined, fallback: string): string 
 
 function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
   const ip = localIP();
-  const url = `ws://${ip}:${DEFAULT_PORT}`;
+  const url = urlWithToken(`ws://${ip}:${DEFAULT_PORT}`);
 
   const server = new WebSocketServer({ port: DEFAULT_PORT, host: "0.0.0.0" });
   wss = server;
@@ -401,6 +426,15 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
   });
 
   server.on("connection", (ws: WebSocket, req: IncomingMessage) => {
+    // Auth gate: when PI_REMOTE_TOKEN is set, reject connections that don't
+    // carry the matching `?token=...`. Peer connections use the same URL
+    // (with the token) so they pass this check too.
+    if (!authOk(tokenFromReqUrl(req.url))) {
+      const remote = req.socket?.remoteAddress ?? "?";
+      console.log(`  [!] rejected unauthorized connection from ${remote}`);
+      try { ws.close(4001, "unauthorized"); } catch { /* ignore */ }
+      return;
+    }
     // Default new connection to client; promoted to peer on peer_hello.
     clientConns.add(ws);
     const inferredName = parseNameFromUrl(req.url, "viewer");
@@ -454,7 +488,9 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
 function startPeer(pi: ExtensionAPI): void {
   if (peerSock || mode === "peer") return;
   mode = "peer";
-  const url = `ws://127.0.0.1:${DEFAULT_PORT}`;
+  // Same shared secret applies for host↔peer on the loopback. If PI_REMOTE_TOKEN
+  // is set, the peer dials with the token so the host's auth gate accepts it.
+  const url = urlWithToken(`ws://127.0.0.1:${DEFAULT_PORT}`);
   console.log(`\n┌─ Pi Remote Control (peer) ──────────────────┐`);
   console.log(`│  joining ${url} as ${SELF_AGENT_NAME}        │`);
   console.log(`└─────────────────────────────────────────────┘\n`);
@@ -519,7 +555,7 @@ function start(pi: ExtensionAPI): void {
   if (mode === "host" && wss) {
     pi.sendMessage({
       customType: "remote",
-      content: `already running: ws://${localIP()}:${DEFAULT_PORT}  (${clientConns.size} viewers, ${peerConns.size} peers)`,
+      content: `already running: ${urlWithToken(`ws://${localIP()}:${DEFAULT_PORT}`)}  (${clientConns.size} viewers, ${peerConns.size} peers)`,
       display: true,
     });
     return;

@@ -33,6 +33,19 @@ The terminal prints your LAN IP and WebSocket URL, e.g.:
 
 Open the app on your phone, enter that URL, connect — and chat with pi from your couch.
 
+## Auth (optional)
+
+By default the server is LAN-trust: anyone who can reach `ws://your-host:8765`
+can drive the agent. To require a shared secret, set `PI_REMOTE_TOKEN` before
+launching pi:
+
+```bash
+PI_REMOTE_TOKEN=$(openssl rand -hex 16) pi -e ~/pi-remote-control/extension.ts
+```
+
+The printed URL/QR will include `?token=…` so scanning works unchanged. Direct
+connections without the matching token are closed with WS code `4001`.
+
 ## Events forwarded to phone
 
 | Pi Event            | Phone Event       |
