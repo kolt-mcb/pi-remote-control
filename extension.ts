@@ -342,30 +342,12 @@ function formatSessionLabel(s: SessionInfo): string {
   return `${trimmed} · ${s.messageCount} msgs · ${date}`;
 }
 
-function handleRemoteResume(pi: ExtensionAPI): boolean {
-  void (async () => {
-    let sessions: SessionInfo[] = [];
-    try {
-      sessions = await SessionManager.listAll();
-    } catch (e) {
-      console.error("[remote-control] list sessions failed:", e);
-      return;
-    }
-    // Show most-recent first; cap at a reasonable number for the dialog.
-    sessions.sort((a, b) => +new Date(b.modified) - +new Date(a.modified));
-    const truncated = sessions.slice(0, 100);
-    showRemoteSelect({
-      title: "Resume session",
-      options: truncated.map((s) => ({ label: formatSessionLabel(s), value: s.path })),
-      onPick: (sessionPath) => {
-        void safeCtx(pi, "/resume", async (ctx) => {
-          await ctx.switchSession(sessionPath);
-        });
-      },
-    });
-  })();
-  return true;
-}
+// handleRemoteResume (which used ctx.switchSession) was removed: switchSession
+// invalidates the extension runtime permanently. The app now resumes saved
+// sessions by sending `spawn_peer` with a sessionPath, which launches
+// `pi --session <path>` as a separate process. See PR #20 + saved-session
+// browser. `formatSessionLabel` survives because the app may want it for
+// fallback rendering of saved-session names; left in place for now.
 
 function sendCommandList(pi: ExtensionAPI, ws: WebSocket): void {
   if (ws.readyState !== 1) return;
@@ -719,15 +701,8 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
       const target = (cmd.targetAgentId as string) || SELF_AGENT_ID;
       const deliverAs =
         cmd.type === "steer" ? "steer" : cmd.type === "follow_up" ? "followUp" : undefined;
-      // Built-in slash commands need rich UI (session metadata, model scope tabs,
-      // tree nav) that ctx.ui.select can't represent without losing data. So for
-      // the most common UI-bearing built-ins we synthesise a flat tap-list on
-      // the phone and act on the pick ourselves, instead of forwarding the
-      // slash text to pi. Targets the local agent only; peer routing untouched.
-      if (target === SELF_AGENT_ID && cmd.type === "prompt") {
-        const cmdName = msg.split(/\s/)[0].slice(1);
-        if (cmdName === "resume" && handleRemoteResume(pi)) break;
-      }
+      // (Prior interception of "/resume" typed as prompt text removed —
+      // the app's saved-session browser handles that path now via spawn_peer.)
       if (target === SELF_AGENT_ID) {
         const sendOpts: { deliverAs?: "steer" | "followUp" } = {};
         if (deliverAs) sendOpts.deliverAs = deliverAs;
@@ -838,14 +813,23 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
     // installed via pi.extensions), detects the WS port is busy, falls back
     // to peer mode, and joins this host's session_list.
     case "spawn_peer": {
+      // Optional sessionPath: when set, the new pi is invoked with --session
+      // <path> so it resumes that saved session instead of starting fresh.
+      // Routes both the [+ New session] button (no sessionPath) and the
+      // saved-session browser (with sessionPath) through this one path.
+      const sessionPath = typeof cmd.sessionPath === "string" ? cmd.sessionPath : "";
       // Detach so the spawned process survives this pi's exit. Inherit env
       // so PI_REMOTE_TOKEN etc. carry through. setsid+script gives it a
       // fake PTY since pi is a TUI and refuses to start without one.
       const logPath = `/tmp/pi-peer-${randomUUID().slice(0, 6)}.log`;
+      // `script -c` takes a single string command; if sessionPath is set,
+      // pass it to pi via --session "<path>". Shell-escape the path.
+      const escapedPath = sessionPath ? sessionPath.replace(/'/g, "'\\''") : "";
+      const piCmd = sessionPath ? `pi --session '${escapedPath}'` : "pi";
       try {
         const child = spawnChild(
           "setsid",
-          ["script", "-qfc", "pi", logPath],
+          ["script", "-qfc", piCmd, logPath],
           {
             detached: true,
             stdio: "ignore",
@@ -854,12 +838,15 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
           },
         );
         child.unref();
-        console.log(`  [*] spawned peer pi (pid=${child.pid}, log=${logPath})`);
+        const label = sessionPath ? `pi --session ${sessionPath}` : "pi";
+        console.log(`  [*] spawned peer (pid=${child.pid}, log=${logPath}): ${label}`);
         hostBcastClients(JSON.stringify({
           type: "extension_ui_request",
           method: "notify",
           id: `notify_peer_${Date.now()}`,
-          message: `Launching a new pi peer… it'll join shortly.`,
+          message: sessionPath
+            ? `Resuming saved session as a new peer…`
+            : `Launching a new pi peer… it'll join shortly.`,
           notifyType: "info",
         }));
       } catch (e: any) {
@@ -872,6 +859,32 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
           notifyType: "error",
         }));
       }
+      break;
+    }
+    case "get_saved_sessions": {
+      // Stream the pi session store to the requesting client. Used by the
+      // app's saved-session browser; each entry is tappable to spawn_peer
+      // with sessionPath set. Cap at 100 most-recent — that's how the
+      // earlier remote /resume flow handled it and is plenty for a phone UI.
+      void (async () => {
+        let list: SessionInfo[] = [];
+        try {
+          list = await SessionManager.listAll();
+        } catch (e: any) {
+          console.warn(`get_saved_sessions: listAll failed: ${e?.message ?? e}`);
+        }
+        list.sort((a, b) => +new Date(b.modified) - +new Date(a.modified));
+        const out = list.slice(0, 100).map((s) => ({
+          path: s.path,
+          name: s.name?.trim() || s.firstMessage?.trim() || s.id,
+          firstMessage: s.firstMessage ?? "",
+          messageCount: s.messageCount ?? 0,
+          modified: typeof s.modified === "number" ? s.modified : Date.parse(String(s.modified)) || 0,
+        }));
+        if (ws.readyState === 1) {
+          ws.send(JSON.stringify({ type: "saved_sessions", sessions: out }));
+        }
+      })();
       break;
     }
     case "get_state": {
