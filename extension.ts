@@ -268,19 +268,35 @@ function hostBcastSessionList(only?: WebSocket): void {
 
 // ── Remote slash-command support ────────────────────────────────────────
 // Commands the phone can execute remotely via `withCommandContext`.
-// Commands NOT listed here are UI-heavy (settings menus, model selectors,
-// file pickers, clipboard) and can't be proxied through the extension API.
+// Commands NOT listed here are either UI-heavy (settings menus, model
+// selectors, file pickers, clipboard) and can't be proxied through the
+// extension API, OR they replace the session and so permanently invalidate
+// our extension runtime (see below).
 const REMOTE_SUPPORTED_COMMANDS = new Set([
-  // Already handled: "resume"
-  "compact",    // ctx.compact()
-  "new",        // ctx.newSession()
-  "reload",     // ctx.reload()
-  "quit",       // ctx.shutdown()
+  "compact",    // ctx.compact()  — safe, no session replacement
+  "quit",       // ctx.shutdown() — pi exits anyway
 ]);
 
-// Built-ins that require TUI-only UI → hide from phone's autocomplete.
+// Built-ins that look supported in principle but break the extension's pi
+// reference. Pi's runtime sets state.staleMessage on ctx.newSession() /
+// switchSession() / fork() / reload() and never clears it, so after one
+// of these any subsequent pi.withCommandContext throws. We surface this
+// as the safeCtx warning banner — better than a crash but still confusing
+// from the user's perspective. Hide them from the phone's autocomplete
+// entirely; the equivalent UX is reachable elsewhere:
+//
+//   /new     → spawn a new pi peer via the [+ New session] button (PR #20)
+//   /resume  → host's pi TUI (or revisit once we wire up an in-app browser)
+//   /reload  → same — host's pi TUI
+//
+// Keep this in REMOTE_UNSUPPORTED_BUILTINS so buildCommandList omits them.
+const REMOTE_STALES = new Set(["new", "resume", "reload"]);
+
+// Built-ins to hide from the phone's autocomplete. Anything not in
+// REMOTE_SUPPORTED_COMMANDS gets hidden, plus the session-replacing
+// commands that would invalidate the extension.
 const REMOTE_UNSUPPORTED_BUILTINS = new Set(BUILTIN_SLASH_COMMANDS
-  .filter(b => !REMOTE_SUPPORTED_COMMANDS.has(b.name) && b.name !== "resume")
+  .filter(b => !REMOTE_SUPPORTED_COMMANDS.has(b.name))
   .map(b => b.name),
 );
 
@@ -777,41 +793,25 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
             notifyType: "info",
           }));
         })();
-      } else if (commandName === "new") {
-        // Send the notify BEFORE newSession runs — once newSession returns
-        // and invalidates `pi`, the captured reference is dead and we can't
-        // safely call hostBcastClients from a follow-up await chain anyway.
-        void (async () => {
-          await safeCtx(pi, "/new", async (ctx) => {
-            hostBcastClients(JSON.stringify({
-              type: "extension_ui_request",
-              method: "notify",
-              id: `notify_new_${Date.now()}`,
-              message: `New session started.`,
-              notifyType: "info",
-            }));
-            await ctx.newSession();
-          });
-        })();
-      } else if (commandName === "reload") {
-        void (async () => {
-          await safeCtx(pi, "/reload", async (ctx) => {
-            hostBcastClients(JSON.stringify({
-              type: "extension_ui_request",
-              method: "notify",
-              id: `notify_reload_${Date.now()}`,
-              message: `Reloading Pi...`,
-              notifyType: "info",
-            }));
-            void ctx.reload();
-          });
-        })();
       } else if (commandName === "quit") {
         void safeCtx(pi, "/quit", async (ctx) => {
           void ctx.shutdown();
         });
-      } else if (commandName === "resume" && handleRemoteResume(pi)) {
-        // /resume is handled by the existing remote session picker
+      } else if (REMOTE_STALES.has(commandName)) {
+        // /new, /resume, /reload — these would invalidate the extension
+        // runtime (see comment on REMOTE_STALES). Route the user to the
+        // working alternatives.
+        const hint =
+          commandName === "new" ? "use the [+ New session] button on the Sessions screen instead" :
+          commandName === "resume" ? "run /resume in the pi terminal" :
+          /* reload */ "run /reload in the pi terminal";
+        hostBcastClients(JSON.stringify({
+          type: "extension_ui_request",
+          method: "notify",
+          id: `notify_stale_path_${Date.now()}`,
+          message: `/${commandName} can't run from the app — ${hint}.`,
+          notifyType: "warning",
+        }));
       } else {
         // Unsupported built-in command — notify the phone
         notifyUnsupportedCommand(commandName);
