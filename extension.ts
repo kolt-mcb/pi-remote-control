@@ -341,12 +341,8 @@ function handleRemoteResume(pi: ExtensionAPI): boolean {
       title: "Resume session",
       options: truncated.map((s) => ({ label: formatSessionLabel(s), value: s.path })),
       onPick: (sessionPath) => {
-        void pi.withCommandContext(async (ctx) => {
-          try {
-            await ctx.switchSession(sessionPath);
-          } catch (e) {
-            console.error("[remote-control] switchSession failed:", e);
-          }
+        void safeCtx(pi, "/resume", async (ctx) => {
+          await ctx.switchSession(sessionPath);
         });
       },
     });
@@ -357,6 +353,42 @@ function handleRemoteResume(pi: ExtensionAPI): boolean {
 function sendCommandList(pi: ExtensionAPI, ws: WebSocket): void {
   if (ws.readyState !== 1) return;
   ws.send(JSON.stringify({ type: "command_list", commands: buildCommandList(pi) }));
+}
+
+/**
+ * Wrap a pi.withCommandContext call so a stale-extension-runtime exception
+ * doesn't crash pi. The extension's captured `pi` reference goes permanently
+ * stale after ctx.newSession()/fork()/switchSession()/reload(); subsequent
+ * pi.withCommandContext calls throw synchronously and (because they run inside
+ * a `void (async () => …)()`) become unhandled rejections that exit pi.
+ *
+ * On stale, we send a notify banner telling the user to restart pi to recover.
+ * Returns false on error so the caller can choose to abort follow-up work.
+ */
+async function safeCtx(
+  pi: ExtensionAPI,
+  label: string,
+  fn: (ctx: any) => Promise<void> | void,
+): Promise<boolean> {
+  try {
+    await pi.withCommandContext(fn);
+    return true;
+  } catch (e: any) {
+    const stale = typeof e?.message === "string" && e.message.includes("stale after session replacement");
+    if (stale) {
+      console.warn(`safeCtx[${label}]: extension is stale, restart pi to recover`);
+      hostBcastClients(JSON.stringify({
+        type: "extension_ui_request",
+        method: "notify",
+        id: `notify_stale_${Date.now()}`,
+        message: `Session was replaced earlier — restart pi to use ${label} again.`,
+        notifyType: "warning",
+      }));
+    } else {
+      console.warn(`safeCtx[${label}] error:`, e?.message ?? e);
+    }
+    return false;
+  }
 }
 
 /**
@@ -713,6 +745,14 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
     // Handles /compact, /new, /reload, /quit via withCommandContext.
     // /resume is handled separately above (has a rich session picker UI).
     // Unsupported built-ins get a notify banner telling the user to use the host TUI.
+    //
+    // KNOWN LIMITATION: ctx.newSession()/fork()/switchSession()/reload()
+    // invalidate the extension's captured `pi` reference. The next call to
+    // pi.withCommandContext from this WS handler throws synchronously inside
+    // the async IIFE, becoming an unhandled rejection that crashes pi.
+    // Until we figure out the proper "refresh pi after session replacement"
+    // pattern (see #19), each handler is wrapped in safeCtx() which catches
+    // the stale error, notifies the user, and returns without taking down pi.
     case "slash_command": {
       const commandName = (cmd.command as string)?.trim().toLowerCase();
       if (!commandName) break;
@@ -722,9 +762,10 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
       if (commandName === "compact") {
         const instructions = (cmd.args as string)?.trim();
         void (async () => {
-          await pi.withCommandContext(async (ctx) => {
+          const ok = await safeCtx(pi, "/compact", async (ctx) => {
             ctx.compact(instructions ? { instructions } : undefined);
           });
+          if (!ok) return;
           hostBcastClients(JSON.stringify({
             type: "extension_ui_request",
             method: "notify",
@@ -736,37 +777,38 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
           }));
         })();
       } else if (commandName === "new") {
+        // Send the notify BEFORE newSession runs — once newSession returns
+        // and invalidates `pi`, the captured reference is dead and we can't
+        // safely call hostBcastClients from a follow-up await chain anyway.
         void (async () => {
-          await pi.withCommandContext(async (ctx) => {
+          await safeCtx(pi, "/new", async (ctx) => {
+            hostBcastClients(JSON.stringify({
+              type: "extension_ui_request",
+              method: "notify",
+              id: `notify_new_${Date.now()}`,
+              message: `New session started.`,
+              notifyType: "info",
+            }));
             await ctx.newSession();
           });
-          hostBcastClients(JSON.stringify({
-            type: "extension_ui_request",
-            method: "notify",
-            id: `notify_new_${Date.now()}`,
-            message: `New session started.`,
-            notifyType: "info",
-          }));
         })();
       } else if (commandName === "reload") {
         void (async () => {
-          await pi.withCommandContext(async (ctx) => {
+          await safeCtx(pi, "/reload", async (ctx) => {
+            hostBcastClients(JSON.stringify({
+              type: "extension_ui_request",
+              method: "notify",
+              id: `notify_reload_${Date.now()}`,
+              message: `Reloading Pi...`,
+              notifyType: "info",
+            }));
             void ctx.reload();
           });
-          hostBcastClients(JSON.stringify({
-            type: "extension_ui_request",
-            method: "notify",
-            id: `notify_reload_${Date.now()}`,
-            message: `Reloading Pi...`,
-            notifyType: "info",
-          }));
         })();
       } else if (commandName === "quit") {
-        void (async () => {
-          await pi.withCommandContext(async (ctx) => {
-            void ctx.shutdown();
-          });
-        })();
+        void safeCtx(pi, "/quit", async (ctx) => {
+          void ctx.shutdown();
+        });
       } else if (commandName === "resume" && handleRemoteResume(pi)) {
         // /resume is handled by the existing remote session picker
       } else {
