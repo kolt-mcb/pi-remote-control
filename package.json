@@ -3,6 +3,12 @@
   "version": "0.1.0",
   "description": "Pi extension for LAN remote control from phone",
   "type": "module",
+  "keywords": ["pi", "pi-package", "pi-extension", "remote-control", "android"],
+  "pi": {
+    "extensions": [
+      "./extension.ts"
+    ]
+  },
   "dependencies": {
     "ws": "^8.18.0",
     "qrcode-terminal": "^0.12.0"
