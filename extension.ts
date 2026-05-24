@@ -23,6 +23,7 @@ import type { RawData } from "ws";
 import type { IncomingMessage } from "node:http";
 import os from "node:os";
 import { randomUUID, timingSafeEqual } from "node:crypto";
+import { spawn as spawnChild } from "node:child_process";
 // Local fork of pi-tui exposes selectListEvents/respondToSelectList so we can
 // surface any SelectList-based selector (built-in or extension) to the phone.
 import { selectListEvents, respondToSelectList } from "@earendil-works/pi-tui";
@@ -824,6 +825,52 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
       if (value) {
         // Deliver to all registered input listeners (generic — no extension coupling)
         for (const cb of inputListeners) cb(id, value);
+      }
+      break;
+    }
+    // ── Spawn a second pi process as a peer ─────────────────────────────
+    // Architectural workaround for pi's extension-lifecycle limitation:
+    // ctx.newSession() / switchSession() / fork() / reload() permanently
+    // invalidate the extension's runtime (state.staleMessage is set and never
+    // cleared except by full /reload, which extensions also can't recover
+    // from). So we don't change sessions in-process; we just spawn another
+    // pi. The new pi auto-loads this same extension (pi-remote-control is
+    // installed via pi.extensions), detects the WS port is busy, falls back
+    // to peer mode, and joins this host's session_list.
+    case "spawn_peer": {
+      // Detach so the spawned process survives this pi's exit. Inherit env
+      // so PI_REMOTE_TOKEN etc. carry through. setsid+script gives it a
+      // fake PTY since pi is a TUI and refuses to start without one.
+      const logPath = `/tmp/pi-peer-${randomUUID().slice(0, 6)}.log`;
+      try {
+        const child = spawnChild(
+          "setsid",
+          ["script", "-qfc", "pi", logPath],
+          {
+            detached: true,
+            stdio: "ignore",
+            env: process.env,
+            cwd: process.cwd(),
+          },
+        );
+        child.unref();
+        console.log(`  [*] spawned peer pi (pid=${child.pid}, log=${logPath})`);
+        hostBcastClients(JSON.stringify({
+          type: "extension_ui_request",
+          method: "notify",
+          id: `notify_peer_${Date.now()}`,
+          message: `Launching a new pi peer… it'll join shortly.`,
+          notifyType: "info",
+        }));
+      } catch (e: any) {
+        console.warn(`  [!] spawn_peer failed: ${e?.message ?? e}`);
+        hostBcastClients(JSON.stringify({
+          type: "extension_ui_request",
+          method: "notify",
+          id: `notify_peer_fail_${Date.now()}`,
+          message: `Couldn't spawn peer: ${e?.message ?? "unknown error"}`,
+          notifyType: "error",
+        }));
       }
       break;
     }
