@@ -1,0 +1,75 @@
+{
+  "description": "Task queue for the 1-hour loop. Each entry: next iteration picks the first uncompleted task, implements it, marks it done.",
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Slash command autocomplete chips",
+      "description": "Show tap-to-autocomplete chips below the input when user types /. Filter /compact /quit etc. with descriptions.",
+      "status": "in-progress",
+      "files": ["android/pi-remote-control-app/app/src/main/java/com/piremote/screens/Screens.kt"]
+    },
+    {
+      "id": 2,
+      "title": "Markdown table rendering",
+      "description": "Parse | header | header | style tables in markdown assistant messages.",
+      "status": "pending",
+      "files": ["android/pi-remote-control-app/app/src/main/java/com/piremote/screens/PiMarkdown.kt"]
+    },
+    {
+      "id": 3,
+      "title": "Copy button on assistant text",
+      "description": "Long-press any assistant message to copy its text to clipboard with toast confirmation.",
+      "status": "pending",
+      "files": ["android/pi-remote-control-app/app/src/main/java/com/piremote/screens/Screens.kt"]
+    },
+    {
+      "id": 4,
+      "title": "Hoisted continuation prompt",
+      "description": "On agent_end, auto-switch input to follow-up mode with a colored hint instead of requiring manual tap.",
+      "status": "pending",
+      "files": ["android/pi-remote-control-app/app/src/main/java/com/piremote/screens/Screens.kt", "android/pi-remote-control-app/app/src/main/java/com/piremote/ChatViewModel.kt"]
+    },
+    {
+      "id": 5,
+      "title": "Attach image flow: show preview in input area",
+      "description": "When user picks images, show thumbnails in a row above/below the input field with × to remove.",
+      "status": "pending",
+      "files": ["android/pi-remote-control-app/app/src/main/java/com/piremote/screens/Screens.kt"]
+    },
+    {
+      "id": 6,
+      "title": "Markdown link unfurl previews",
+      "description": "Turn bare URLs in assistant messages into tappable chips or short link previews (domain + path).",
+      "status": "pending",
+      "files": ["android/pi-remote-control-app/app/src/main/java/com/piremote/screens/PiMarkdown.kt"]
+    },
+    {
+      "id": 7,
+      "title": "'Delete session' long-press on session tab",
+      "description": "Long-press a tab pill to confirm delete that peer's chat history from Room DB.",
+      "status": "pending",
+      "files": ["android/pi-remote-control-app/app/src/main/java/com/piremote/screens/Screens.kt", "android/pi-remote-control-app/app/src/main/java/com/piremote/ChatViewModel.kt"]
+    },
+    {
+      "id": 8,
+      "title": "Fix game_touch JSON syntax error",
+      "description": "sendGameTouch has broken JSON: '\"pressed\"$pressed' should be ',\"pressed\":$pressed'.",
+      "status": "pending",
+      "files": ["android/pi-remote-control-app/app/src/main/java/com/piremote/PiWebSocket.kt"]
+    },
+    {
+      "id": 9,
+      "title": "Banner auto-expiry",
+      "description": "NotifyBanner items should auto-dismiss after 8 seconds to prevent scrollback clutter from stale notifications.",
+      "status": "pending",
+      "files": ["android/pi-remote-control-app/app/src/main/java/com/piremote/PiWebSocket.kt"]
+    },
+    {
+      "id": 10,
+      "title": "Hotkey bar: make / key trigger slash autocomplete",
+      "description": "When user taps the / key in the hotkey bar, explicitly focus input and show autocomplete row.",
+      "status": "pending",
+      "files": ["android/pi-remote-control-app/app/src/main/java/com/piremote/screens/Screens.kt"]
+    }
+  ]
+}
