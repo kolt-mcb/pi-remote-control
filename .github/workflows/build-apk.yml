@@ -40,15 +40,42 @@ jobs:
       - name: Build debug APK
         run: ./gradlew assembleDebug --no-daemon --stacktrace
 
+      # Compute the same versionCode build.gradle.kts uses (git commit count
+      # on the checked-out ref) so we can stamp it into the artifact name and
+      # release body. The in-app updater reads versionCode from the release
+      # body to decide whether the user is out of date — no need to download
+      # the APK just to check.
+      - name: Compute versionCode / versionName
+        id: ver
+        working-directory: ${{ github.workspace }}
+        run: |
+          # checkout@v4 does a shallow clone by default — need full history
+          # for `git rev-list --count`.
+          git fetch --unshallow || true
+          CODE=$(git rev-list --count HEAD)
+          NAME=$(git rev-parse --short=8 HEAD)
+          echo "versionCode=$CODE" >> "$GITHUB_OUTPUT"
+          echo "versionName=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Rename APK with versionCode
+        working-directory: android/pi-remote-control-app/app/build/outputs/apk/debug
+        run: |
+          mv app-debug.apk "pi-remote-v${{ steps.ver.outputs.versionCode }}.apk"
+
       - name: Publish to "latest" release
         if: github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
           name: Latest build
+          # versionCode / versionName lines are parsed by the in-app updater
+          # (case-sensitive). Don't reword without bumping the updater.
           body: |
             Auto-built debug APK from commit ${{ github.sha }}.
             Triggered by ${{ github.event_name }} on ${{ github.ref_name }}.
+
+            versionCode: ${{ steps.ver.outputs.versionCode }}
+            versionName: ${{ steps.ver.outputs.versionName }}
           prerelease: true
           make_latest: "false"
-          files: android/pi-remote-control-app/app/build/outputs/apk/debug/app-debug.apk
+          files: android/pi-remote-control-app/app/build/outputs/apk/debug/pi-remote-v${{ steps.ver.outputs.versionCode }}.apk
