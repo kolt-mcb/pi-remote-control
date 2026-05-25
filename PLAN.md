@@ -226,7 +226,7 @@ Show "Reconnecting..." status
 
 ### 4d. QR code scan to connect
 
-CameraX or ZXing barcode scanner. Detect `piremote://192.168.1.128:8765` → auto-connect.
+CameraX or ZXing barcode scanner. Detect `piremote://192.168.x.x:8765` → auto-connect.
 
 Dependency:
 ```kotlin
@@ -421,7 +421,7 @@ Tool outputs containing source code now render with syntax highlighting, line nu
 **PiService.kt** — ForegroundService with dataSync type:
 - `onCreate()` → creates NotificationChannel (IMPORTANCE_LOW, "Pi Connection")
 - `onStartCommand()` → `startForeground(1001, notification)`, returns `START_STICKY`
-- **Notification**: title="Pi Remote — Connected", text="Connected to 192.168.1.128", subtext dynamically updates:
+- **Notification**: title="Pi Remote — Connected", text="Connected to 192.168.x.x", subtext dynamically updates:
   - "Thinking..." when agent busy
   - "N messages" when idle with messages  
   - "Connected" default
