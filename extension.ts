@@ -206,48 +206,6 @@ selectListEvents.on("dismiss", (e: { id: string }) => {
   hostBcastClients(JSON.stringify({ type: "extension_ui_dismiss", id: e.id }));
 });
 
-// ── Remote-only select dialogs ─────────────────────────────────────────
-// For built-in slash commands like /resume that have rich local TUI selectors
-// we can't cleanly remote, the extension synthesises a flat select-from-list
-// dialog on the phone using extension_ui_request. Each pending dialog is
-// tracked here so the response can be routed back to the right handler.
-// Ids use the "rmt_" prefix to distinguish from SelectList-bridged "sl_" ids.
-type RemoteSelectPending = {
-  labelToValue: Map<string, string>;
-  onPick: (value: string) => void;
-  onCancel: () => void;
-};
-const remoteSelects = new Map<string, RemoteSelectPending>();
-let remoteSelectIdCounter = 0;
-
-function showRemoteSelect(opts: {
-  title: string;
-  options: Array<{ label: string; value: string }>;
-  onPick: (value: string) => void;
-  onCancel?: () => void;
-}): void {
-  if (opts.options.length === 0) {
-    opts.onCancel?.();
-    return;
-  }
-  remoteSelectIdCounter++;
-  const id = `rmt_${Date.now().toString(36)}_${remoteSelectIdCounter.toString(36)}`;
-  const labelToValue = new Map<string, string>();
-  for (const o of opts.options) labelToValue.set(o.label, o.value);
-  remoteSelects.set(id, {
-    labelToValue,
-    onPick: opts.onPick,
-    onCancel: opts.onCancel ?? (() => { /* noop */ }),
-  });
-  hostBcastClients(JSON.stringify({
-    type: "extension_ui_request",
-    method: "select",
-    id,
-    title: opts.title,
-    options: opts.options.map((o) => o.label),
-  }));
-}
-
 // Local agent state (this pi's own agent — applies in both host and peer mode)
 let localBusy = false;
 let localMessageCount = 0;
@@ -365,27 +323,10 @@ function buildCommandList(pi: ExtensionAPI): { name: string; description: string
   return out;
 }
 
-// ── Remote handlers for built-in slash commands ────────────────────────
-//
-// These run when the phone sends "/foo" through `prompt` and the command is
-// a built-in that needs a UI selector (e.g., /resume). The handler returns
-// `true` if it claimed the command (extension already responded), `false` to
-// let the normal sendUserMessage path proceed (which would just ship the text
-// to the LLM — usually wrong for built-ins, hence the interception).
-
-function formatSessionLabel(s: SessionInfo): string {
-  const name = s.name?.trim() || s.firstMessage?.trim() || s.id;
-  const trimmed = name.length > 40 ? name.slice(0, 39) + "…" : name;
-  const date = new Date(s.modified).toISOString().slice(0, 10);
-  return `${trimmed} · ${s.messageCount} msgs · ${date}`;
-}
-
 // handleRemoteResume (which used ctx.switchSession) was removed: switchSession
 // invalidates the extension runtime permanently. The app now resumes saved
 // sessions by sending `spawn_peer` with a sessionPath, which launches
-// `pi --session <path>` as a separate process. See PR #20 + saved-session
-// browser. `formatSessionLabel` survives because the app may want it for
-// fallback rendering of saved-session names; left in place for now.
+// `pi --session <path>` as a separate process. See PR #20 + saved-session browser.
 
 function sendCommandList(pi: ExtensionAPI, ws: WebSocket): void {
   if (ws.readyState !== 1) return;
@@ -972,18 +913,6 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
           // We sent labels to the phone; translate back to the SelectItem value.
           const value = liveSelectListLabels.get(id)?.get(label) ?? label;
           respondToSelectList(id, value);
-        }
-      } else if (id.startsWith("rmt_")) {
-        // Remote-only dialog (built-in command intercept). Route to the
-        // pending callback and clear.
-        const pending = remoteSelects.get(id);
-        if (!pending) break;
-        remoteSelects.delete(id);
-        if (cancelled) {
-          pending.onCancel();
-        } else {
-          const value = pending.labelToValue.get(label) ?? label;
-          pending.onPick(value);
         }
       }
       break;
