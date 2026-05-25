@@ -2,12 +2,6 @@
 
 ## Latest Updates (2026-05-25)
 
-### Hourly Loop Infrastructure ✅
-Self-improving loop running every 1 hour to add features/fixes/polish.
-- `.loop-tasks.json` — task queue with 10 queued improvements
-- `.loop-run.sh` — script that reads next pending task and shows instructions
-- Loop started: `pi-remote-improvements` @ 1h interval via loop skill
-
 ### Slash Command Autocomplete ✅
 Terminal-styled chips below the input when user types `/`:
 - Filter commands by typed prefix (first word after `/`)
