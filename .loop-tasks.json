@@ -5,7 +5,9 @@
       "id": 1,
       "title": "Slash command autocomplete chips",
       "description": "Show tap-to-autocomplete chips below the input when user types /. Filter /compact /quit etc. with descriptions.",
-      "status": "in-progress",
+      "status": "done",
+      "doneAt": "2026-05-24T23:55Z",
+      "commit": "78bb40b",
       "files": ["android/pi-remote-control-app/app/src/main/java/com/piremote/screens/Screens.kt"]
     },
     {
