@@ -22,8 +22,10 @@ import { WebSocketServer, WebSocket } from "ws";
 import type { RawData } from "ws";
 import type { IncomingMessage } from "node:http";
 import os from "node:os";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { spawn as spawnChild } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 // Local fork of pi-tui exposes selectListEvents/respondToSelectList so we can
 // surface any SelectList-based selector (built-in or extension) to the phone.
 import { selectListEvents, respondToSelectList } from "@earendil-works/pi-tui";
@@ -38,11 +40,47 @@ import qrcodeTerminal from "qrcode-terminal";
 
 const DEFAULT_PORT = 8765;
 
-// Optional shared-secret auth. If PI_REMOTE_TOKEN is set, every WS connection
-// must carry `?token=...` matching the env var; otherwise the connection is
-// closed with code 4001. Unset → no auth (preserves the original LAN-trust
-// behaviour for users who explicitly want it).
-const AUTH_TOKEN = process.env.PI_REMOTE_TOKEN ?? "";
+// Shared-secret auth. Every WS connection must carry `?token=...`; mismatches
+// are closed with code 4001. Token resolution, in order:
+//   1. PI_REMOTE_TOKEN env var (explicit override).
+//   2. ~/.pi/agent/pi-remote-control.token if it exists (persistent).
+//   3. Auto-generate a fresh 32-hex-char token, write it to (2) for the next
+//      launch, and use it now.
+//   4. Disabled only if PI_REMOTE_CONTROL_NO_AUTH=1 — opt-out for users who
+//      explicitly want the old LAN-trust behaviour and accept the risk.
+//
+// Sets `AUTH_TOKEN_SOURCE` to label what happened so the startup banner can
+// be honest about it.
+type TokenSource = "env" | "file" | "generated" | "disabled";
+function resolveToken(): { token: string; source: TokenSource; tokenFile: string } {
+  const tokenFile = path.join(
+    process.env.HOME || ".",
+    ".pi", "agent", "pi-remote-control.token",
+  );
+  if (process.env.PI_REMOTE_CONTROL_NO_AUTH === "1") {
+    return { token: "", source: "disabled", tokenFile };
+  }
+  const fromEnv = process.env.PI_REMOTE_TOKEN ?? "";
+  if (fromEnv) return { token: fromEnv, source: "env", tokenFile };
+  try {
+    if (fs.existsSync(tokenFile)) {
+      const t = fs.readFileSync(tokenFile, "utf8").trim();
+      if (t) return { token: t, source: "file", tokenFile };
+    }
+  } catch (e: any) {
+    console.warn(`pi-remote-control: failed to read ${tokenFile}: ${e?.message ?? e}`);
+  }
+  // Generate a fresh token and try to persist it. 32 hex chars = 128 bits.
+  const t = randomBytes(16).toString("hex");
+  try {
+    fs.mkdirSync(path.dirname(tokenFile), { recursive: true });
+    fs.writeFileSync(tokenFile, t + "\n", { mode: 0o600 });
+  } catch (e: any) {
+    console.warn(`pi-remote-control: couldn't persist token to ${tokenFile}: ${e?.message ?? e} — will regenerate next launch`);
+  }
+  return { token: t, source: "generated", tokenFile };
+}
+const { token: AUTH_TOKEN, source: AUTH_TOKEN_SOURCE, tokenFile: AUTH_TOKEN_FILE } = resolveToken();
 
 function authOk(provided: string): boolean {
   if (!AUTH_TOKEN) return true;
@@ -442,7 +480,24 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
     upsertSelfAgent();
     console.log(`\n┌─ Pi Remote Control (host) ──────────────────┐`);
     console.log(`│  ${url}  │`);
-    console.log(`└─────────────────────────────────────────────┘\n`);
+    console.log(`└─────────────────────────────────────────────┘`);
+    // Honest one-line summary of the auth state so the user knows what's
+    // protecting (or not protecting) their pi.
+    switch (AUTH_TOKEN_SOURCE) {
+      case "env":
+        console.log(`  auth: shared-secret token from PI_REMOTE_TOKEN`);
+        break;
+      case "file":
+        console.log(`  auth: shared-secret token from ${AUTH_TOKEN_FILE}`);
+        break;
+      case "generated":
+        console.log(`  auth: NEW shared-secret token generated and stored at ${AUTH_TOKEN_FILE}`);
+        break;
+      case "disabled":
+        console.log(`  auth: DISABLED (PI_REMOTE_CONTROL_NO_AUTH=1). Anyone who can reach this port can drive the agent.`);
+        break;
+    }
+    console.log();
     // Render a QR code the Android app can scan. The Android scanner accepts
     // ws://, wss://, piremote://, and bare host:port; we use ws:// so a
     // generic QR scanner (camera app) also recognises it as a URL.
