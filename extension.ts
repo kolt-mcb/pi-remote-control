@@ -17,7 +17,7 @@
  *   /remote-stop      — stops it
  */
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
 import { WebSocketServer, WebSocket } from "ws";
 import type { RawData } from "ws";
 import type { IncomingMessage } from "node:http";
@@ -29,9 +29,7 @@ import path from "node:path";
 // Local fork of pi-tui exposes selectListEvents/respondToSelectList so we can
 // surface any SelectList-based selector (built-in or extension) to the phone.
 import { selectListEvents, respondToSelectList } from "@earendil-works/pi-tui";
-// Local fork of pi-coding-agent re-exports BUILTIN_SLASH_COMMANDS so the phone
-// can offer the full catalogue (/resume, /model, /theme, …) instead of just the
-// extension/skill/template subset that pi.getCommands() returns.
+// BUILTIN_SLASH_COMMANDS used to match supported remote commands (/compact, /quit).
 import { BUILTIN_SLASH_COMMANDS, SessionManager } from "@mariozechner/pi-coding-agent";
 import type { SessionInfo } from "@mariozechner/pi-coding-agent";
 import qrcodeTerminal from "qrcode-terminal";
@@ -114,23 +112,57 @@ interface AgentSession {
   lastActivity: number;
   messageCount: number;
   turnIndex: number;
+  pid?: number;
+  // pi session file id; changes when the session is replaced (/new, /resume),
+  // so the phone can tell "fresh session" from "reconnected to the same one".
+  sessionId?: string;
 }
 
 // ── State ───────────────────────────────────────────────────────────────
 
-// This pi's stable identity for its lifetime.
-const SELF_AGENT_ID = randomUUID().slice(0, 8);
+// This pi's stable identity for the lifetime of the PROCESS — stored on
+// globalThis so it survives extension reloads (e.g. /new replaces the session
+// and re-imports this module). Without this, every /new would mint a new id,
+// the phone's selected-session would go stale, and its commands would be
+// dropped by the `target !== SELF_AGENT_ID` guard.
+const SELF_AGENT_ID: string =
+  ((globalThis as any).__piRemoteSelfId ??= randomUUID().slice(0, 8));
 const SELF_AGENT_NAME = `Pi-${SELF_AGENT_ID.slice(0, 4)}`;
 
 type Mode = "stopped" | "host" | "peer";
 let mode: Mode = "stopped";
 
-// Host-mode state
-let wss: WebSocketServer | null = null;
-const clientConns = new Set<WebSocket>(); // Android viewers only
-const peerConns = new Map<string, WebSocket>(); // peer agentId -> ws
-const wsToPeerId = new WeakMap<WebSocket, string>();
-const agents = new Map<string, AgentSession>(); // includes self + peers
+// Host-mode state. The transport — WebSocket server + live connections + agent
+// registry — lives on globalThis so it SURVIVES extension reloads. A session
+// replacement (/new, /resume) re-imports this module with a fresh instance; by
+// keeping the same server and sockets, the phone stays connected instead of
+// disconnecting and racing a reconnect through the rebind gap. Client message
+// handlers route to `currentPi`, which each freshly-loaded instance updates.
+interface RCTransport {
+  wss: WebSocketServer | null;
+  clientConns: Set<WebSocket>;
+  peerConns: Map<string, WebSocket>;
+  wsToPeerId: WeakMap<WebSocket, string>;
+  peerPids: Map<string, number>;
+  agents: Map<string, AgentSession>;
+  currentPi: ExtensionAPI | null;
+}
+const RC: RCTransport = ((globalThis as any).__piRemoteTransport ??= {
+  wss: null,
+  clientConns: new Set<WebSocket>(),
+  peerConns: new Map<string, WebSocket>(),
+  wsToPeerId: new WeakMap<WebSocket, string>(),
+  peerPids: new Map<string, number>(),
+  agents: new Map<string, AgentSession>(),
+  currentPi: null,
+});
+// Module-level aliases into the persistent collections (only ever mutated, never
+// reassigned — so these references stay valid and shared across reloads).
+const clientConns = RC.clientConns; // Android viewers only
+const peerConns = RC.peerConns; // peer agentId -> ws
+const wsToPeerId = RC.wsToPeerId;
+const peerPids = RC.peerPids; // peer agentId -> pid (for killing)
+const agents = RC.agents; // includes self + peers
 
 // Peer-mode state
 let peerSock: WebSocket | null = null;
@@ -227,18 +259,55 @@ function nowSelfStatus(): AgentSession["status"] {
   return localBusy ? "busy" : "idle";
 }
 
+// The label the app shows for this session. Mirrors pi's /resume list:
+// an explicit /name, else the first user message, else the agent's short id.
+let selfTitle = SELF_AGENT_NAME;
+// Live session manager, captured from the first ctx we see, so upsertSelfAgent
+// can refresh the title on every broadcast (not just after an agent turn).
+let selfSm: any = null;
+
+function textFromContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((p: any) => (typeof p === "string" ? p : p?.type === "text" ? (p.text ?? "") : ""))
+      .join("")
+      .trim();
+  }
+  return "";
+}
+
+// Same precedence pi uses for SessionInfo.name in the /resume selector.
+function computeSelfTitle(sm: any): string {
+  try {
+    const name = sm?.getSessionName?.()?.trim();
+    if (name) return name;
+    for (const e of sm?.getEntries?.() ?? []) {
+      if (e?.type !== "message" || e.message?.role !== "user") continue;
+      const text = textFromContent(e.message?.content);
+      if (text) return (text.split("\n").find((l: string) => l.trim()) ?? text).trim().slice(0, 60);
+    }
+  } catch (e: any) {
+    console.warn(`pi-remote-control: computeSelfTitle failed: ${e?.message ?? e}`);
+  }
+  return SELF_AGENT_NAME;
+}
+
 function upsertSelfAgent(): void {
   const existing = agents.get(SELF_AGENT_ID);
   const now = Date.now();
+  if (selfSm) selfTitle = computeSelfTitle(selfSm);
   agents.set(SELF_AGENT_ID, {
     id: SELF_AGENT_ID,
-    name: SELF_AGENT_NAME,
+    name: selfTitle,
     kind: "self",
     status: nowSelfStatus(),
     connectedAt: existing?.connectedAt ?? now,
     lastActivity: now,
     messageCount: localMessageCount,
     turnIndex: localTurnIndex,
+    pid: process.pid,
+    sessionId: (() => { try { return selfSm?.getSessionId?.(); } catch { return undefined; } })(),
   });
 }
 
@@ -262,86 +331,150 @@ function hostBcastSessionList(only?: WebSocket): void {
   }
 }
 
-// ── Remote slash-command support ────────────────────────────────────────
-// Commands the phone can execute remotely via `withCommandContext`.
-// Commands NOT listed here are either UI-heavy (settings menus, model
-// selectors, file pickers, clipboard) and can't be proxied through the
-// extension API, OR they replace the session and so permanently invalidate
-// our extension runtime (see below).
-const REMOTE_SUPPORTED_COMMANDS = new Set([
-  "compact",    // ctx.compact()  — safe, no session replacement
-  "quit",       // ctx.shutdown() — pi exits anyway
-]);
+// ── Theme sync ────────────────────────────────────────────────────────────
+// The phone mirrors the host Pi's active theme. Pi's Theme object only exposes
+// per-role colors as ANSI escapes (the page background isn't a theme color —
+// the terminal uses its own bg), so we decode those escapes back to hex and let
+// the phone pick a light/dark base palette for the surfaces we can't read. Role
+// names line up 1:1 with the phone's palette parser, so no key remapping needed.
+const THEME_FG_KEYS = [
+  "accent", "border", "borderAccent", "borderMuted", "success", "error", "warning",
+  "muted", "dim", "text", "thinkingText", "userMessageText", "toolTitle",
+  "mdHeading", "mdLink", "mdLinkUrl", "mdCode", "mdCodeBlock", "mdCodeBlockBorder",
+  "mdQuote", "mdQuoteBorder", "mdListBullet",
+  "syntaxComment", "syntaxKeyword", "syntaxFunction", "syntaxString", "syntaxNumber",
+  "syntaxType", "syntaxOperator", "syntaxPunctuation",
+  "thinkingLow", "thinkingMedium", "thinkingHigh",
+] as const;
+const THEME_BG_KEYS = [
+  "selectedBg", "userMessageBg", "toolPendingBg", "toolSuccessBg", "toolErrorBg",
+] as const;
 
-// Built-ins that look supported in principle but break the extension's pi
-// reference. Pi's runtime sets state.staleMessage on ctx.newSession() /
-// switchSession() / fork() / reload() and never clears it, so after one
-// of these any subsequent pi.withCommandContext throws. We surface this
-// as the safeCtx warning banner — better than a crash but still confusing
-// from the user's perspective. Hide them from the phone's autocomplete
-// entirely; the equivalent UX is reachable elsewhere:
-//
-//   /new     → spawn a new pi peer via the [+ New session] button (PR #20)
-//   /resume  → host's pi TUI (or revisit once we wire up an in-app browser)
-//   /reload  → same — host's pi TUI
-//
-// Keep this in REMOTE_UNSUPPORTED_BUILTINS so buildCommandList omits them.
-const REMOTE_STALES = new Set(["new", "resume", "reload"]);
-
-// Built-ins to hide from the phone's autocomplete. Anything not in
-// REMOTE_SUPPORTED_COMMANDS gets hidden, plus the session-replacing
-// commands that would invalidate the extension.
-const REMOTE_UNSUPPORTED_BUILTINS = new Set(BUILTIN_SLASH_COMMANDS
-  .filter(b => !REMOTE_SUPPORTED_COMMANDS.has(b.name))
-  .map(b => b.name),
-);
-
-/** Send a notify banner to the phone explaining a command needs the host TUI */
-function notifyUnsupportedCommand(name: string): void {
-  hostBcastClients(JSON.stringify({
-    type: "extension_ui_request",
-    method: "notify",
-    id: "notify_unsupported_" + Date.now(),
-    message: `⚠ /${name} requires the host TUI. Type it directly in the Pi terminal.`,
-    notifyType: "warning",
-  }));
-}
-
-function buildCommandList(pi: ExtensionAPI): { name: string; description: string }[] {
-  const out: { name: string; description: string }[] = [];
-  // Built-ins first — but filter out ones that need TUI-only UI.
-  for (const b of BUILTIN_SLASH_COMMANDS) {
-    if (!REMOTE_UNSUPPORTED_BUILTINS.has(b.name)) {
-      out.push({ name: b.name, description: b.description });
-    }
+// xterm-256 index → hex (mirrors pi's own ansi256ToHex so 256-color themes match).
+function ansi256ToHex(index: number): string {
+  const basic = [
+    "#000000", "#800000", "#008000", "#808000", "#000080", "#800080", "#008080", "#c0c0c0",
+    "#808080", "#ff0000", "#00ff00", "#ffff00", "#0000ff", "#ff00ff", "#00ffff", "#ffffff",
+  ];
+  if (index < 16) return basic[index];
+  if (index < 232) {
+    const c = index - 16;
+    const conv = (n: number) => (n === 0 ? 0 : 55 + n * 40).toString(16).padStart(2, "0");
+    return `#${conv(Math.floor(c / 36))}${conv(Math.floor((c % 36) / 6))}${conv(c % 6)}`;
   }
-  // Extension/skill/template commands are fine — they expand via executeSlashCommands.
-  try {
-    const cmds = (pi as { getCommands?: () => Array<{ name: string; description?: string }> }).getCommands?.() ?? [];
-    for (const c of cmds) out.push({ name: c.name, description: c.description ?? "" });
-  } catch { /* ignore */ }
-  return out;
+  const g = (8 + (index - 232) * 10).toString(16).padStart(2, "0");
+  return `#${g}${g}${g}`;
 }
 
-// handleRemoteResume (which used ctx.switchSession) was removed: switchSession
-// invalidates the extension runtime permanently. The app now resumes saved
-// sessions by sending `spawn_peer` with a sessionPath, which launches
-// `pi --session <path>` as a separate process. See PR #20 + saved-session browser.
+// Decode an SGR color escape (truecolor or 256) back to hex.
+// Returns undefined for the default-color escapes (\x1b[39m / \x1b[49m).
+function ansiColorToHex(seq: string): string | undefined {
+  if (!seq) return undefined;
+  const tc = seq.match(/\[(?:38|48);2;(\d+);(\d+);(\d+)m/);
+  if (tc) {
+    const hx = (n: string) => Math.max(0, Math.min(255, parseInt(n, 10))).toString(16).padStart(2, "0");
+    return `#${hx(tc[1])}${hx(tc[2])}${hx(tc[3])}`;
+  }
+  const c256 = seq.match(/\[(?:38|48);5;(\d+)m/);
+  if (c256) return ansi256ToHex(parseInt(c256[1], 10));
+  return undefined;
+}
 
-function sendCommandList(pi: ExtensionAPI, ws: WebSocket): void {
+function themeToColors(theme: Theme): Record<string, string> {
+  const colors: Record<string, string> = {};
+  for (const key of THEME_FG_KEYS) {
+    try {
+      const hex = ansiColorToHex(theme.getFgAnsi(key));
+      if (hex) colors[key] = hex;
+    } catch { /* role not defined in this theme */ }
+  }
+  for (const key of THEME_BG_KEYS) {
+    try {
+      const hex = ansiColorToHex(theme.getBgAnsi(key));
+      if (hex) colors[key] = hex;
+    } catch { /* role not defined in this theme */ }
+  }
+  return colors;
+}
+
+// Last theme broadcast, cached so a fresh connection can be told immediately —
+// the connection handler has no ExtensionContext to read the live theme from.
+let lastThemePayload: string | null = null;
+let lastThemeName: string | undefined;
+
+// Perceived luminance (0-255) of a #rrggbb string.
+function brightness(hex: string): number {
+  const m = hex.replace("#", "");
+  if (m.length !== 6) return 0;
+  const r = parseInt(m.slice(0, 2), 16);
+  const g = parseInt(m.slice(2, 4), 16);
+  const b = parseInt(m.slice(4, 6), 16);
+  return 0.299 * r + 0.587 * g + 0.114 * b;
+}
+
+// Decide light vs dark from the theme's own background tones, not its name —
+// names lie: "Twilight" and "Front End Delight" are dark themes that contain
+// the substring "light". Pi's page bg isn't a theme role, but the accent
+// backgrounds track it. Fall back to a word-boundary name check if none exist.
+function themeIsLight(colors: Record<string, string>, name: string): boolean {
+  const bgKeys = ["userMessageBg", "selectedBg", "toolPendingBg", "toolSuccessBg", "toolErrorBg"];
+  const samples = bgKeys.map((k) => colors[k]).filter((v): v is string => !!v);
+  if (samples.length > 0) {
+    const avg = samples.reduce((sum, hex) => sum + brightness(hex), 0) / samples.length;
+    return avg > 128;
+  }
+  return /\blight\b/i.test(name) && !/\bdark\b/i.test(name);
+}
+
+function buildThemePayload(theme: Theme): string {
+  const name = theme.name ?? "";
+  const colors = themeToColors(theme);
+  return JSON.stringify({
+    type: "theme_info",
+    theme: { name, isLight: themeIsLight(colors, name), colors },
+  });
+}
+
+// Capture the live theme from an event context; re-broadcast when it changes.
+function syncTheme(theme: Theme | undefined): void {
+  if (!theme) return;
+  try {
+    lastThemePayload = buildThemePayload(theme);
+    if (theme.name !== lastThemeName) {
+      lastThemeName = theme.name;
+      hostBcastClients(lastThemePayload);
+    }
+  } catch { /* theme sync is best-effort */ }
+}
+
+function sendCurrentTheme(ws: WebSocket): void {
+  if (ws.readyState === 1 && lastThemePayload) ws.send(lastThemePayload);
+}
+
+// ── Remote slash-command support ────────────────────────────────────────
+// The phone can run any built-in slash command on the host via the command
+// context's executeInputLine() (added by our pi fork): it drives pi's editor
+// submit path, so selector commands (/model, /settings, /tree, …) open their
+// selectors — which surface on the phone through the SelectList bridge — while
+// output commands (/copy, /export, /share) run on the host machine.
+//
+// The exceptions below REPLACE the session and would invalidate this
+// extension's runtime, so they're routed to safe alternatives instead.
+const REMOTE_STALES = new Set(["resume", "reload"]);
+
+// All built-ins are offered to the phone so the menu mirrors pi's own.
+function buildCommandList(): { name: string; description: string }[] {
+  return BUILTIN_SLASH_COMMANDS.map((b) => ({ name: b.name, description: b.description }));
+}
+
+function sendCommandList(ws: WebSocket): void {
   if (ws.readyState !== 1) return;
-  ws.send(JSON.stringify({ type: "command_list", commands: buildCommandList(pi) }));
+  ws.send(JSON.stringify({ type: "command_list", commands: buildCommandList() }));
 }
 
 /**
- * Wrap a pi.withCommandContext call so a stale-extension-runtime exception
- * doesn't crash pi. The extension's captured `pi` reference goes permanently
- * stale after ctx.newSession()/fork()/switchSession()/reload(); subsequent
- * pi.withCommandContext calls throw synchronously and (because they run inside
- * a `void (async () => …)()`) become unhandled rejections that exit pi.
- *
- * On stale, we send a notify banner telling the user to restart pi to recover.
- * Returns false on error so the caller can choose to abort follow-up work.
+ * Catch stale-extension-runtime exceptions that would crash pi.
+ * Sends a notify banner and returns false on error.
  */
 async function safeCtx(
   pi: ExtensionAPI,
@@ -382,6 +515,54 @@ function emitAgentEvent(obj: Record<string, unknown>): void {
   }
 }
 
+// ── Rendered-presentation bridge ────────────────────────────────────────────
+// Mirror another extension's *actual* presentation to the phone: re-render its
+// custom Component (message renderer / tool renderResult) to ANSI lines at the
+// device's column width and ship those lines. The app renders them verbatim, so
+// colors, backgrounds, and layout match — reflowed to the phone, not the desktop.
+//
+// Requires the patched pi build that exposes getMessageRenderer/getToolDefinition
+// on the extension API (they exist on the runner; stock builds don't forward
+// them). Everything here degrades to undefined → the app falls back to plain text.
+let clientCols = 60;                       // device width in columns; set by {type:"viewport"}
+let piApi: ExtensionAPI | null = null;     // captured in the default export for module-level use
+
+function componentToLines(component: any): string[] | undefined {
+  try {
+    const lines = component?.render?.(clientCols);
+    return Array.isArray(lines) && lines.length > 0 ? lines.map(String) : undefined;
+  } catch { return undefined; }
+}
+
+function renderCustomMessageLines(message: any, theme: any): string[] | undefined {
+  try {
+    const customType = message?.customType;
+    // Skip entries with no custom presentation, and our own "[Remote]" messages.
+    if (!customType || customType === "remote" || !theme) return undefined;
+    const getRenderer = (piApi as any)?.getMessageRenderer;
+    if (typeof getRenderer !== "function") return undefined;
+    const renderer = getRenderer.call(piApi, customType);
+    if (typeof renderer !== "function") return undefined;
+    return componentToLines(renderer(message, { expanded: true }, theme));
+  } catch { return undefined; }
+}
+
+function renderToolResultLines(toolName: string, result: any, theme: any): string[] | undefined {
+  try {
+    if (!toolName || !theme) return undefined;
+    const getDef = (piApi as any)?.getToolDefinition;
+    if (typeof getDef !== "function") return undefined;
+    const renderResult = getDef.call(piApi, toolName)?.renderResult;
+    if (typeof renderResult !== "function") return undefined;
+    // Some tools take a 4th render-context (e.g. pi-subagents reads
+    // context.state for animation timers). We produce a one-shot static
+    // snapshot, so pass a permissive stub so they don't throw on the missing
+    // live context; the no-op redraw means no terminal-side animation.
+    const renderContext = { state: {}, requestRedraw: () => {}, expanded: true };
+    return componentToLines(renderResult(result, { expanded: true }, theme, renderContext));
+  } catch { return undefined; }
+}
+
 function parseNameFromUrl(reqUrl: string | undefined, fallback: string): string {
   if (!reqUrl) return fallback;
   try {
@@ -398,7 +579,7 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
   const url = urlWithToken(`ws://${ip}:${DEFAULT_PORT}`);
 
   const server = new WebSocketServer({ port: DEFAULT_PORT, host: "0.0.0.0" });
-  wss = server;
+  RC.wss = server;
 
   let bound = false;
   let bindFailed = false;
@@ -407,7 +588,7 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
   server.on("error", (err: any) => {
     if (err?.code === "EADDRINUSE") {
       bindFailed = true;
-      wss = null;
+      RC.wss = null;
       try { server.close(); } catch { /* ignore */ }
       onBindFail();
     }
@@ -469,13 +650,17 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
 
     hostBcastClients(JSON.stringify({ type: "connected", clients: clientConns.size }));
     hostBcastSessionList();
-    sendCommandList(pi, ws);
+    sendCommandList(ws);
+    // Send the current Pi theme palette so the phone UI mirrors the terminal
+    sendCurrentTheme(ws);
 
     ws.on("message", (data: RawData) => {
       const text = data.toString();
       try {
         const cmd = JSON.parse(text) as Record<string, unknown>;
-        handleHostCmd(cmd, pi, ws);
+        // Route to the current instance, not the one that bound the server —
+        // after a session replacement this socket outlives the old instance.
+        handleHostCmd(cmd, RC.currentPi ?? pi, ws);
       } catch {
         ws.send(JSON.stringify({ type: "error", error: "Bad JSON" }));
       }
@@ -486,6 +671,7 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
       if (peerId) {
         peerConns.delete(peerId);
         agents.delete(peerId);
+        peerPids.delete(peerId);
         wsToPeerId.delete(ws);
         console.log(`  [-] peer ${peerId} disconnected`);
       } else {
@@ -496,14 +682,13 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
     };
 
     ws.on("close", drop);
-    ws.on("error", drop);
   });
 
   // Safety net in case neither 'listening' nor 'error' fires (shouldn't happen).
   setTimeout(() => {
     if (!bound && !bindFailed) {
       bindFailed = true;
-      wss = null;
+      RC.wss = null;
       try { server.close(); } catch { /* ignore */ }
       onBindFail();
     }
@@ -530,6 +715,7 @@ function startPeer(pi: ExtensionAPI): void {
       type: "peer_hello",
       agentId: SELF_AGENT_ID,
       name: SELF_AGENT_NAME,
+      pid: process.pid,
     }));
     pi.sendMessage({
       customType: "remote",
@@ -579,12 +765,19 @@ function stopPeer(): void {
 // ── Unified start/stop ──────────────────────────────────────────────────
 
 function start(pi: ExtensionAPI): void {
-  if (mode === "host" && wss) {
-    pi.sendMessage({
-      customType: "remote",
-      content: `already running: ${urlWithToken(`ws://${localIP()}:${DEFAULT_PORT}`)}  (${clientConns.size} viewers, ${peerConns.size} peers)`,
-      display: true,
-    });
+  // Route the persistent server's client message handlers to THIS instance.
+  // Essential after a session replacement: the same sockets keep delivering,
+  // but commands must execute against the new session's pi, not the stale one.
+  RC.currentPi = pi;
+
+  if (RC.wss) {
+    // Server survived from an earlier load — either we're already host, or a
+    // session replacement (/new, /resume) just re-imported this module. Adopt
+    // the live server instead of rebinding (the phone stays connected) and push
+    // the current session to clients so they refresh (and clear on a new id).
+    mode = "host";
+    upsertSelfAgent();
+    hostBcastSessionList();
     return;
   }
   if (mode === "peer" && peerSock) {
@@ -609,8 +802,8 @@ function stop(pi: ExtensionAPI): void {
   // Flip mode first so peer-close handlers don't try to auto-reconnect.
   mode = "stopped";
 
-  if (wasMode === "host" && wss) {
-    wss.close();
+  if (wasMode === "host" && RC.wss) {
+    RC.wss.close();
     for (const ws of clientConns) {
       try { ws.close(); } catch { /* ignore */ }
     }
@@ -619,7 +812,8 @@ function stop(pi: ExtensionAPI): void {
     }
     clientConns.clear();
     peerConns.clear();
-    wss = null;
+    peerPids.clear();
+    RC.wss = null;
   }
 
   if (wasMode === "peer") {
@@ -638,17 +832,67 @@ function stop(pi: ExtensionAPI): void {
   });
 }
 
+// Run a slash command against THIS pi's own session. Used both for commands
+// the phone targets at our self agent and for ones forwarded to us as a peer
+// (route_slash_command). /compact and /quit use dedicated context actions;
+// /resume and /reload are routed to notices; everything else (incl. /new) goes
+// through pi's editor submit path via ctx.executeInputLine.
+function executeSlashLocally(pi: ExtensionAPI, commandName: string, args: string): void {
+  if (commandName === "compact") {
+    const instructions = args.trim();
+    void (async () => {
+      const ok = await safeCtx(pi, "/compact", async (ctx) => {
+        ctx.compact(instructions ? { instructions } : undefined);
+      });
+      if (!ok) return;
+      hostBcastClients(JSON.stringify({
+        type: "extension_ui_request",
+        method: "notify",
+        id: `notify_compact_${Date.now()}`,
+        message: instructions ? `Compacting with custom instructions...` : `Compacting session context...`,
+        notifyType: "info",
+      }));
+    })();
+  } else if (commandName === "quit") {
+    void safeCtx(pi, "/quit", async (ctx) => { void ctx.shutdown(); });
+  } else if (REMOTE_STALES.has(commandName)) {
+    const hint =
+      commandName === "resume" ? "run /resume in the pi terminal" :
+      /* reload */ "run /reload in the pi terminal";
+    hostBcastClients(JSON.stringify({
+      type: "extension_ui_request",
+      method: "notify",
+      id: `notify_stale_path_${Date.now()}`,
+      message: `/${commandName} can't run from the app — ${hint}.`,
+      notifyType: "warning",
+    }));
+  } else {
+    const a = args.trim();
+    const line = a ? `/${commandName} ${a}` : `/${commandName}`;
+    void safeCtx(pi, `/${commandName}`, async (ctx) => { await ctx.executeInputLine(line); });
+  }
+}
+
 // ── Host: inbound commands ──────────────────────────────────────────────
 
 function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSocket): void {
   switch (cmd.type as string) {
+    case "viewport": {
+      // App reports its width in monospace columns so we re-render extension
+      // components to fit the device. Clamp to a sane range.
+      const cols = Number(cmd.cols);
+      if (Number.isFinite(cols)) clientCols = Math.max(20, Math.min(400, Math.floor(cols)));
+      break;
+    }
     case "peer_hello": {
       const peerId = (cmd.agentId as string) || randomUUID().slice(0, 8);
       const name = (cmd.name as string) || `Pi-${peerId.slice(0, 4)}`;
+      const peerPid = typeof cmd.pid === "number" ? cmd.pid : undefined;
       // Promote this ws from client to peer.
       clientConns.delete(ws);
       peerConns.set(peerId, ws);
       wsToPeerId.set(ws, peerId);
+      if (peerPid) peerPids.set(peerId, peerPid);
       const now = Date.now();
       agents.set(peerId, {
         id: peerId,
@@ -659,6 +903,7 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
         lastActivity: now,
         messageCount: 0,
         turnIndex: 0,
+        pid: peerPid ?? undefined,
       });
       console.log(`  [*] peer joined: ${peerId} (${name})`);
       ws.send(JSON.stringify({ type: "peer_ack", hostAgentId: SELF_AGENT_ID }));
@@ -697,15 +942,10 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
       const target = (cmd.targetAgentId as string) || SELF_AGENT_ID;
       const deliverAs =
         cmd.type === "steer" ? "steer" : cmd.type === "follow_up" ? "followUp" : undefined;
-      // (Prior interception of "/resume" typed as prompt text removed —
-      // the app's saved-session browser handles that path now via spawn_peer.)
       if (target === SELF_AGENT_ID) {
         const sendOpts: { deliverAs?: "steer" | "followUp" } = {};
         if (deliverAs) sendOpts.deliverAs = deliverAs;
-        // Pi's ImageContent is { type:"image", data, mimeType } — `data` is raw
-        // base64 without the data-URI prefix. Sending the full `data:...;base64,`
-        // URI yields "Non-base64 digit found" from Claude because `:`, `/`, `;`, `,`
-        // aren't valid base64 characters.
+        // Strip data-URI prefix: Pi expects raw base64 data. Full URI chars cause Claude errors.
         if (images.length > 0) {
           type TextMsg = { type: "text"; text: string };
           type ImageMsg = { type: "image"; data: string; mimeType: string };
@@ -724,68 +964,33 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
       } else {
         const peerWs = peerConns.get(target);
         if (peerWs && peerWs.readyState === 1) {
-          peerWs.send(JSON.stringify({ type: "route_prompt", message: msg, deliverAs, executeSlashCommands: msg.startsWith("/"), images }));
+          peerWs.send(JSON.stringify({ type: "route_prompt", message: msg, deliverAs, images }));
         }
       }
       break;
     }
     // ── Remote slash-command execution ───────────────────────────────────
-    // Handles /compact, /new, /reload, /quit via withCommandContext.
-    // /resume is handled separately above (has a rich session picker UI).
-    // Unsupported built-ins get a notify banner telling the user to use the host TUI.
-    //
-    // KNOWN LIMITATION: ctx.newSession()/fork()/switchSession()/reload()
-    // invalidate the extension's captured `pi` reference. The next call to
-    // pi.withCommandContext from this WS handler throws synchronously inside
-    // the async IIFE, becoming an unhandled rejection that crashes pi.
-    // Until we figure out the proper "refresh pi after session replacement"
-    // pattern (see #19), each handler is wrapped in safeCtx() which catches
-    // the stale error, notifies the user, and returns without taking down pi.
+    // /compact and /quit use dedicated context actions (nice phone feedback).
+    // /resume, /reload are REMOTE_STALES — routed to notices for now.
+    // Everything else (including /new) runs on the host via ctx.executeInputLine().
+    // Session-replacing commands like /new fire session_shutdown (which closes
+    // client sockets) then rebind a fresh host; the phone auto-reconnects to the
+    // new session. safeCtx wraps pi.withCommandContext to catch stale crashes.
     case "slash_command": {
       const commandName = (cmd.command as string)?.trim().toLowerCase();
       if (!commandName) break;
+      const args = (cmd.args as string) ?? "";
       const target = (cmd.targetAgentId as string) || SELF_AGENT_ID;
-      if (target !== SELF_AGENT_ID) break; // Only handle local agent
-
-      if (commandName === "compact") {
-        const instructions = (cmd.args as string)?.trim();
-        void (async () => {
-          const ok = await safeCtx(pi, "/compact", async (ctx) => {
-            ctx.compact(instructions ? { instructions } : undefined);
-          });
-          if (!ok) return;
-          hostBcastClients(JSON.stringify({
-            type: "extension_ui_request",
-            method: "notify",
-            id: `notify_compact_${Date.now()}`,
-            message: instructions
-              ? `Compacting with custom instructions...`
-              : `Compacting session context...`,
-            notifyType: "info",
-          }));
-        })();
-      } else if (commandName === "quit") {
-        void safeCtx(pi, "/quit", async (ctx) => {
-          void ctx.shutdown();
-        });
-      } else if (REMOTE_STALES.has(commandName)) {
-        // /new, /resume, /reload — these would invalidate the extension
-        // runtime (see comment on REMOTE_STALES). Route the user to the
-        // working alternatives.
-        const hint =
-          commandName === "new" ? "use the [+ New session] button on the Sessions screen instead" :
-          commandName === "resume" ? "run /resume in the pi terminal" :
-          /* reload */ "run /reload in the pi terminal";
-        hostBcastClients(JSON.stringify({
-          type: "extension_ui_request",
-          method: "notify",
-          id: `notify_stale_path_${Date.now()}`,
-          message: `/${commandName} can't run from the app — ${hint}.`,
-          notifyType: "warning",
-        }));
+      if (target === SELF_AGENT_ID) {
+        executeSlashLocally(pi, commandName, args);
       } else {
-        // Unsupported built-in command — notify the phone
-        notifyUnsupportedCommand(commandName);
+        // Targeted at a peer — forward over the peer link so it runs the
+        // command on its own session (mirrors route_prompt). Without this,
+        // slash commands sent while viewing a peer tab silently do nothing.
+        const peerWs = peerConns.get(target);
+        if (peerWs && peerWs.readyState === 1) {
+          peerWs.send(JSON.stringify({ type: "route_slash_command", command: commandName, args }));
+        }
       }
       break;
     }
@@ -799,27 +1004,12 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
       }
       break;
     }
-    // ── Spawn a second pi process as a peer ─────────────────────────────
-    // Architectural workaround for pi's extension-lifecycle limitation:
-    // ctx.newSession() / switchSession() / fork() / reload() permanently
-    // invalidate the extension's runtime (state.staleMessage is set and never
-    // cleared except by full /reload, which extensions also can't recover
-    // from). So we don't change sessions in-process; we just spawn another
-    // pi. The new pi auto-loads this same extension (pi-remote-control is
-    // installed via pi.extensions), detects the WS port is busy, falls back
-    // to peer mode, and joins this host's session_list.
+    // ── Spawn a second pi process as a peer ────────────────────────
     case "spawn_peer": {
-      // Optional sessionPath: when set, the new pi is invoked with --session
-      // <path> so it resumes that saved session instead of starting fresh.
-      // Routes both the [+ New session] button (no sessionPath) and the
-      // saved-session browser (with sessionPath) through this one path.
       const sessionPath = typeof cmd.sessionPath === "string" ? cmd.sessionPath : "";
-      // Detach so the spawned process survives this pi's exit. Inherit env
-      // so PI_REMOTE_TOKEN etc. carry through. setsid+script gives it a
-      // fake PTY since pi is a TUI and refuses to start without one.
+      // setsid+script provides a fake PTY; detached process survives parent pi exit.
       const logPath = `/tmp/pi-peer-${randomUUID().slice(0, 6)}.log`;
-      // `script -c` takes a single string command; if sessionPath is set,
-      // pass it to pi via --session "<path>". Shell-escape the path.
+      // Shell-escape the sessionPath for script -c command string.
       const escapedPath = sessionPath ? sessionPath.replace(/'/g, "'\\''") : "";
       const piCmd = sessionPath ? `pi --session '${escapedPath}'` : "pi";
       try {
@@ -857,11 +1047,53 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
       }
       break;
     }
+    // ── Close a peer (or self) session ──────────────────────────────
+    case "close_session": {
+      const targetId = (cmd.agentId as string)?.trim();
+      if (!targetId) break;
+
+      if (targetId === SELF_AGENT_ID) {
+        // Close the self session — this shuts down this pi entirely.
+        void safeCtx(pi, "/quit", async (ctx) => {
+          void ctx.shutdown();
+        });
+        hostBcastClients(JSON.stringify({
+          type: "extension_ui_request",
+          method: "notify",
+          id: `notify_close_self_${Date.now()}`,
+          message: `Shutting down ${SELF_AGENT_NAME}…`,
+          notifyType: "info",
+        }));
+      } else {
+        // Close a peer — kill its process.
+        const peerPid = typeof cmd.pid === "number" ? cmd.pid : peerPids.get(targetId) ?? null;
+        const peerWs = peerConns.get(targetId);
+        if (peerPid) {
+          try {
+            process.kill(peerPid, "SIGTERM");
+            console.log(`  [!] killed peer pid=${peerPid} (${targetId})`);
+          } catch (e: any) {
+            console.warn(`  [!] kill ${peerPid} failed: ${e?.message ?? e}`);
+          }
+        }
+        if (peerWs && peerWs.readyState === 1) {
+          try { peerWs.close(); } catch { /* ignore */ }
+          // The 'close' handler will clean up peerConns + agents.
+        }
+        peerPids.delete(targetId);
+        hostBcastClients(JSON.stringify({
+          type: "extension_ui_request",
+          method: "notify",
+          id: `notify_close_${Date.now()}`,
+          message: `Closing session…`,
+          notifyType: "info",
+        }));
+        hostBcastSessionList();
+      }
+      break;
+    }
     case "get_saved_sessions": {
-      // Stream the pi session store to the requesting client. Used by the
-      // app's saved-session browser; each entry is tappable to spawn_peer
-      // with sessionPath set. Cap at 100 most-recent — that's how the
-      // earlier remote /resume flow handled it and is plenty for a phone UI.
+      // Stream saved sessions to the requesting client, capped at 100 most recent.
       void (async () => {
         let list: SessionInfo[] = [];
         try {
@@ -888,7 +1120,7 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
         type: "response",
         command: "get_state",
         success: true,
-        data: { clients: clientConns.size, connected: clientConns.size > 0 },
+        data: { clients: clientConns.size },
       }));
       break;
     }
@@ -897,7 +1129,7 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
       break;
     }
     case "get_commands": {
-      sendCommandList(pi, ws);
+      sendCommandList(ws);
       break;
     }
     case "extension_ui_response": {
@@ -929,9 +1161,7 @@ function handlePeerInbound(msg: Record<string, unknown>, pi: ExtensionAPI): void
       const images = (msg.images as string[]) || [];
       if (!text && images.length === 0) break;
       const deliverAs = msg.deliverAs as "steer" | "followUp" | undefined;
-      const executeSlashCommands = (msg.executeSlashCommands as boolean) ?? text.startsWith("/");
-      // Pi's ImageContent is { type:"image", data, mimeType } — `data` is raw
-      // base64 without the data-URI prefix. See SELF_AGENT_ID branch above.
+      // Strip data-URI prefix: Pi expects raw base64 data.
       const peerSendOpts: { deliverAs?: "steer" | "followUp" } = {};
       if (deliverAs) peerSendOpts.deliverAs = deliverAs;
       if (images.length > 0) {
@@ -951,6 +1181,12 @@ function handlePeerInbound(msg: Record<string, unknown>, pi: ExtensionAPI): void
       }
       break;
     }
+    case "route_slash_command": {
+      // Host forwarded a slash command targeted at us — run it on our session.
+      const commandName = (msg.command as string)?.trim().toLowerCase();
+      if (commandName) executeSlashLocally(pi, commandName, (msg.args as string) ?? "");
+      break;
+    }
     // peer_ack and any other host->peer messages: ignored (no state to update)
   }
 }
@@ -958,6 +1194,14 @@ function handlePeerInbound(msg: Record<string, unknown>, pi: ExtensionAPI): void
 // ── Extension factory ───────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+
+  // Capture the API so module-level render helpers can reach the renderer
+  // registry. Log once if this pi build doesn't expose it (presentation
+  // mirroring then degrades to plain text — see the rendered-presentation bridge).
+  piApi = pi;
+  if (typeof (pi as any).getMessageRenderer !== "function") {
+    console.log("[pi-remote-control] note: pi build does not expose getMessageRenderer/getToolDefinition — extension presentation mirroring disabled (text fallback).");
+  }
 
   // ── Commands ──────────────────────────────────────────────────────────
 
@@ -980,8 +1224,10 @@ export default function (pi: ExtensionAPI) {
 
   // ── Agent events ─────────────────────────────────────────────────────
 
-  pi.on("agent_start", async (_e) => {
+  pi.on("agent_start", async (_e, ctx) => {
+    syncTheme(ctx.hasUI ? ctx.ui.theme : undefined);
     localBusy = true;
+    selfSm = ctx.sessionManager;
     if (mode === "host") {
       upsertSelfAgent();
       hostBcastSessionList();
@@ -989,9 +1235,10 @@ export default function (pi: ExtensionAPI) {
     emitAgentEvent({ type: "agent_start" });
   });
 
-  pi.on("agent_end", async (e) => {
+  pi.on("agent_end", async (e, ctx) => {
     localBusy = false;
     localMessageCount = (e.messages ?? []).length;
+    selfSm = ctx.sessionManager;
     if (mode === "host") {
       upsertSelfAgent();
       hostBcastSessionList();
@@ -1034,8 +1281,15 @@ export default function (pi: ExtensionAPI) {
     emitAgentEvent({ type: "message_start", message: e.message });
   });
 
-  pi.on("message_end", async (e) => {
-    emitAgentEvent({ type: "message_end", message: e.message });
+  pi.on("message_end", async (e, ctx) => {
+    // For custom-message entries, mirror the extension's own rendering: re-render
+    // its Component at the phone's width and attach the ANSI lines to the message.
+    const theme = ctx?.hasUI ? ctx.ui.theme : undefined;
+    const ansiLines = renderCustomMessageLines(e.message, theme);
+    emitAgentEvent({
+      type: "message_end",
+      message: ansiLines ? { ...e.message, ansiLines } : e.message,
+    });
   });
 
   pi.on("message_update", async (e: any) => {
@@ -1081,23 +1335,20 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_execution_update", async (e: any) => {
-    const cr = e.partialResult;
-    const content = Array.isArray(cr?.content)
-      ? cr.content.slice(-1).map((c: any) => c.text ?? "").join("")
+    const content = Array.isArray(e.partialResult?.content)
+      ? e.partialResult.content.slice(-1).map((c: any) => c.text ?? "").join("")
       : "";
     if (content) {
-      const stream = (e as any)._stream || content;
       emitAgentEvent({
         type: "tool_update",
         toolCallId: e.toolCallId,
         toolName: e.toolName,
-        content: stream,
+        content,
       });
-      (e as any)._stream = (stream as string) + content;
     }
   });
 
-  pi.on("tool_execution_end", async (e: any) => {
+  pi.on("tool_execution_end", async (e: any, ctx: any) => {
     const cr = e.result;
     // Extract content: try .text[] first, then .content[] (file read results)
     let content = "";
@@ -1110,12 +1361,17 @@ export default function (pi: ExtensionAPI) {
     if (!content && typeof cr === "object") {
       content = (cr.text as string) ?? (cr.output as string) ?? "";
     }
+    // Mirror the tool's own result renderer (e.g. pi-subagents' per-step cards)
+    // by re-rendering it at the phone's width; falls back to `content` text.
+    const theme = ctx?.hasUI ? ctx.ui.theme : undefined;
+    const ansiLines = renderToolResultLines(e.toolName ?? "", cr, theme);
     emitAgentEvent({
       type: "tool_end",
       toolCallId: e.toolCallId,
       toolName: e.toolName ?? "",
       content,
       isError: e.isError ?? false,
+      ...(ansiLines ? { ansiLines } : {}),
     });
   });
 
@@ -1174,7 +1430,7 @@ export default function (pi: ExtensionAPI) {
         type: "game_frame",
         width: e.width,
         height: e.height,
-        data: Buffer.from(frame.buffer).toString("hex"),
+        data: Buffer.from(frame).toString("hex"),
       });
     }
   });
@@ -1197,7 +1453,6 @@ export default function (pi: ExtensionAPI) {
     });
   });
 
-
   pi.on("extensionUiSetTitle", async (e: any) => {
     emitAgentEvent({
       type: "extension_ui_request",
@@ -1207,27 +1462,37 @@ export default function (pi: ExtensionAPI) {
     });
   });
 
+  // Speculative event name; harmless if pi never emits it. Accepts `text` or `value`.
+  pi.on("extensionUiSetEditorText", async (e: any) => {
+    emitAgentEvent({
+      type: "extension_ui_request",
+      method: "set_editor_text",
+      id: "editor",
+      text: e.text ?? e.value ?? "",
+    });
+  });
+
   // ── Status ────────────────────────────────────────────────────────────
 
-  pi.on("session_start", async () => {
-    // ensures stop() is safe on reload
-    wss = null;
-    peerSock = null;
-    mode = "stopped";
-    // Auto-start the WS server. The whole purpose of loading this extension
-    // is to expose the agent over LAN; making the user type /remote-control
-    // every launch is just friction. If the port is already bound by another
-    // pi on this host, start(pi) falls back to peer mode automatically.
-    // Set PI_REMOTE_CONTROL_NO_AUTOSTART=1 to skip and use /remote-control manually.
+  pi.on("session_start", async (_e, ctx) => {
+    // Capture the active theme up front so the first phone connection mirrors it.
+    syncTheme(ctx.hasUI ? ctx.ui.theme : undefined);
+    // Capture the session manager so the session title (first user message /
+    // /name) is right the moment the phone connects, before any agent turn.
+    selfSm = ctx.sessionManager;
+    // Auto-start on session load. Set PI_REMOTE_CONTROL_NO_AUTOSTART=1 to disable.
     if (process.env.PI_REMOTE_CONTROL_NO_AUTOSTART !== "1") {
       try { start(pi); } catch { /* ignore */ }
     }
   });
 
   pi.on("session_shutdown", async () => {
-    if (wss) { try { wss.close(); } catch { /* ignore */ } }
+    // Session replacement (/new, /resume) re-imports this module. KEEP the
+    // persistent server + client sockets (on RC) so the phone stays connected
+    // and the next instance adopts them — no disconnect, no rebind gap. Only
+    // tear down peer-mode state, which is per-instance. A real shutdown (/quit)
+    // exits the process, which frees the server regardless.
     if (peerSock) { try { peerSock.close(); } catch { /* ignore */ } }
-    wss = null;
     peerSock = null;
     mode = "stopped";
   });
