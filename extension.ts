@@ -623,13 +623,12 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
     // Render a QR code the Android app can scan. The Android scanner accepts
     // ws://, wss://, piremote://, and bare host:port; we use ws:// so a
     // generic QR scanner (camera app) also recognises it as a URL.
+    // Print the QR/URL to the TERMINAL only. We deliberately do NOT inject this
+    // (or any [Remote] status) into the pi conversation — it clutters the chat
+    // and, in peer/subagent pis, floods it with noise. The host's terminal is
+    // where you scan the code.
     qrcodeTerminal.generate(url, { small: true }, (qr: string) => {
       console.log(qr);
-      pi.sendMessage({
-        customType: "remote",
-        content: `active: ${url}  (host: ${SELF_AGENT_NAME})\nScan with the Pi Remote app:\n${qr}`,
-        display: true,
-      });
     });
   });
 
@@ -717,11 +716,8 @@ function startPeer(pi: ExtensionAPI): void {
       name: SELF_AGENT_NAME,
       pid: process.pid,
     }));
-    pi.sendMessage({
-      customType: "remote",
-      content: `peer mode: joined as ${SELF_AGENT_NAME}`,
-      display: true,
-    });
+    // Terminal-only — don't inject peer status into the conversation.
+    console.log(`[pi-remote-control] peer mode: joined as ${SELF_AGENT_NAME}`);
   });
 
   sock.on("message", (data: RawData) => {
@@ -781,12 +777,7 @@ function start(pi: ExtensionAPI): void {
     return;
   }
   if (mode === "peer" && peerSock) {
-    pi.sendMessage({
-      customType: "remote",
-      content: `already running in peer mode as ${SELF_AGENT_NAME}`,
-      display: true,
-    });
-    return;
+    return; // already a peer — nothing to do, and don't spam the conversation
   }
 
   startHost(pi, () => {
@@ -824,12 +815,7 @@ function stop(pi: ExtensionAPI): void {
   localBusy = false;
   localMessageCount = 0;
   localTurnIndex = 0;
-
-  pi.sendMessage({
-    customType: "remote",
-    content: "stopped",
-    display: true,
-  });
+  console.log("[pi-remote-control] stopped");
 }
 
 // Run a slash command against THIS pi's own session. Used both for commands
