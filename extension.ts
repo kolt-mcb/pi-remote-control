@@ -681,6 +681,10 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
     };
 
     ws.on("close", drop);
+    // A 'ws' socket is an EventEmitter: an 'error' with no listener throws an
+    // uncaught exception that crashes pi. 'close' fires after 'error', so drop()
+    // still runs the cleanup — this listener just keeps the error from killing us.
+    ws.on("error", () => { try { drop(); } catch { /* already dropping */ } });
   });
 
   // Safety net in case neither 'listening' nor 'error' fires (shouldn't happen).
