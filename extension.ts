@@ -297,6 +297,23 @@ let selfTitle = SELF_AGENT_NAME;
 // Live session manager, captured from the first ctx we see, so upsertSelfAgent
 // can refresh the title on every broadcast (not just after an agent turn).
 let selfSm: any = null;
+// Interactive UI context (footer/status bar, theme), captured at session_start;
+// null when this pi has no TTY (RPC/print mode). We surface host/peer state here
+// via setStatus — a footer chip below the chat, like other pi extensions — rather
+// than console.log lines, which pi renders into the conversation itself.
+let selfUi: any = null;
+const REMOTE_STATUS_KEY = "remote-control";
+function setRemoteStatus(text: string | undefined): void {
+  try { selfUi?.setStatus(REMOTE_STATUS_KEY, text); } catch { /* ignore */ }
+}
+// Recompute the footer chip from the current mode. Called on every transition
+// (and on session_start, so a re-imported session re-shows it on the new footer).
+function refreshRemoteStatus(): void {
+  let text: string | undefined;
+  if (mode === "host") text = "remote · host";
+  else if (mode === "peer") text = peerSock ? `remote · peer ${SELF_AGENT_NAME}` : "remote · connecting…";
+  setRemoteStatus(text); // undefined when stopped → clears the chip
+}
 
 function textFromContent(content: unknown): string {
   if (typeof content === "string") return content;
@@ -632,6 +649,7 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
     bound = true;
     mode = "host";
     upsertSelfAgent();
+    refreshRemoteStatus(); // "remote · host" chip in the footer
     console.log("\n" + box("Pi Remote Control (host)", [url]).join("\n"));
     // Honest one-line summary of the auth state so the user knows what's
     // protecting (or not protecting) their pi.
@@ -736,7 +754,7 @@ function startPeer(pi: ExtensionAPI): void {
   // Same shared secret applies for host↔peer on the loopback. If PI_REMOTE_TOKEN
   // is set, the peer dials with the token so the host's auth gate accepts it.
   const url = urlWithToken(`ws://127.0.0.1:${DEFAULT_PORT}`);
-  console.log("\n" + box("Pi Remote Control (peer)", [`joining ${url} as ${SELF_AGENT_NAME}`]).join("\n") + "\n");
+  refreshRemoteStatus(); // "remote · connecting…" in the footer (peerSock still null)
 
   const sock = new WebSocket(url);
   peerSock = sock;
@@ -748,8 +766,8 @@ function startPeer(pi: ExtensionAPI): void {
       name: SELF_AGENT_NAME,
       pid: process.pid,
     }));
-    // Terminal-only — don't inject peer status into the conversation.
-    console.log(`[pi-remote-control] peer mode: joined as ${SELF_AGENT_NAME}`);
+    // Show the joined peer name as a footer chip — never inject it into the chat.
+    refreshRemoteStatus();
   });
 
   sock.on("message", (data: RawData) => {
@@ -766,6 +784,7 @@ function startPeer(pi: ExtensionAPI): void {
     if (peerSock === sock) peerSock = null;
     if (mode !== "peer") return;
     if (peerReconnectTimer) return;
+    refreshRemoteStatus(); // peerSock now null → "remote · connecting…"
     // Host may have died. Try to reclaim the port; if still busy, retry as peer.
     peerReconnectTimer = setTimeout(() => {
       peerReconnectTimer = null;
@@ -805,10 +824,12 @@ function start(pi: ExtensionAPI): void {
     // the current session to clients so they refresh (and clear on a new id).
     mode = "host";
     upsertSelfAgent();
+    refreshRemoteStatus();
     hostBcastSessionList();
     return;
   }
   if (mode === "peer" && peerSock) {
+    refreshRemoteStatus();
     return; // already a peer — nothing to do, and don't spam the conversation
   }
 
@@ -847,6 +868,7 @@ function stop(pi: ExtensionAPI): void {
   localBusy = false;
   localMessageCount = 0;
   localTurnIndex = 0;
+  refreshRemoteStatus(); // mode is "stopped" → clears the footer chip
   console.log("[pi-remote-control] stopped");
 }
 
@@ -1418,6 +1440,10 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_e, ctx) => {
     // Capture the active theme up front so the first phone connection mirrors it.
     syncTheme(ctx.hasUI ? ctx.ui.theme : undefined);
+    // Capture the UI context so host/peer state shows as a footer chip, and
+    // re-assert it now — a re-imported session (/new, /resume) gets a fresh footer.
+    selfUi = ctx.hasUI ? ctx.ui : null;
+    refreshRemoteStatus();
     // Capture the session manager so the session title (first user message /
     // /name) is right the moment the phone connects, before any agent turn.
     selfSm = ctx.sessionManager;
