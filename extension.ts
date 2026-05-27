@@ -276,6 +276,21 @@ function nowSelfStatus(): AgentSession["status"] {
   return localBusy ? "busy" : "idle";
 }
 
+// Draw a banner box that sizes itself to its content. The old fixed-width
+// borders (47 cols) didn't account for the URL+token in the body, so the
+// content row's closing `│` floated far past the top/bottom corners and the
+// box never closed. Computing the width from the longest line keeps every
+// border aligned no matter how long the URL or agent name is.
+function box(title: string, lines: string[]): string[] {
+  const pad = 2; // inner spaces on each side of the content
+  const titleRun = title.length + 3; // "─ " + title + " "
+  const inner = Math.max(titleRun, ...lines.map((l) => l.length + pad * 2));
+  const top = `┌─ ${title} ${"─".repeat(inner - titleRun)}┐`;
+  const body = lines.map((l) => `│${" ".repeat(pad)}${l.padEnd(inner - pad * 2)}${" ".repeat(pad)}│`);
+  const bottom = `└${"─".repeat(inner)}┘`;
+  return [top, ...body, bottom];
+}
+
 // The label the app shows for this session. Mirrors pi's /resume list:
 // an explicit /name, else the first user message, else the agent's short id.
 let selfTitle = SELF_AGENT_NAME;
@@ -617,9 +632,7 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
     bound = true;
     mode = "host";
     upsertSelfAgent();
-    console.log(`\n┌─ Pi Remote Control (host) ──────────────────┐`);
-    console.log(`│  ${url}  │`);
-    console.log(`└─────────────────────────────────────────────┘`);
+    console.log("\n" + box("Pi Remote Control (host)", [url]).join("\n"));
     // Honest one-line summary of the auth state so the user knows what's
     // protecting (or not protecting) their pi.
     switch (AUTH_TOKEN_SOURCE) {
@@ -723,9 +736,7 @@ function startPeer(pi: ExtensionAPI): void {
   // Same shared secret applies for host↔peer on the loopback. If PI_REMOTE_TOKEN
   // is set, the peer dials with the token so the host's auth gate accepts it.
   const url = urlWithToken(`ws://127.0.0.1:${DEFAULT_PORT}`);
-  console.log(`\n┌─ Pi Remote Control (peer) ──────────────────┐`);
-  console.log(`│  joining ${url} as ${SELF_AGENT_NAME}        │`);
-  console.log(`└─────────────────────────────────────────────┘\n`);
+  console.log("\n" + box("Pi Remote Control (peer)", [`joining ${url} as ${SELF_AGENT_NAME}`]).join("\n") + "\n");
 
   const sock = new WebSocket(url);
   peerSock = sock;
