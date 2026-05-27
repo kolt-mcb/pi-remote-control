@@ -1065,51 +1065,6 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
       }
       break;
     }
-    // ── Close a peer (or self) session ──────────────────────────────
-    case "close_session": {
-      const targetId = (cmd.agentId as string)?.trim();
-      if (!targetId) break;
-
-      if (targetId === SELF_AGENT_ID) {
-        // Close the self session — this shuts down this pi entirely.
-        void safeCtx(pi, "/quit", async (ctx) => {
-          void ctx.shutdown();
-        });
-        hostBcastClients(JSON.stringify({
-          type: "extension_ui_request",
-          method: "notify",
-          id: `notify_close_self_${Date.now()}`,
-          message: `Shutting down ${SELF_AGENT_NAME}…`,
-          notifyType: "info",
-        }));
-      } else {
-        // Close a peer — kill its process.
-        const peerPid = typeof cmd.pid === "number" ? cmd.pid : peerPids.get(targetId) ?? null;
-        const peerWs = peerConns.get(targetId);
-        if (peerPid) {
-          try {
-            process.kill(peerPid, "SIGTERM");
-            console.log(`  [!] killed peer pid=${peerPid} (${targetId})`);
-          } catch (e: any) {
-            console.warn(`  [!] kill ${peerPid} failed: ${e?.message ?? e}`);
-          }
-        }
-        if (peerWs && peerWs.readyState === 1) {
-          try { peerWs.close(); } catch { /* ignore */ }
-          // The 'close' handler will clean up peerConns + agents.
-        }
-        peerPids.delete(targetId);
-        hostBcastClients(JSON.stringify({
-          type: "extension_ui_request",
-          method: "notify",
-          id: `notify_close_${Date.now()}`,
-          message: `Closing session…`,
-          notifyType: "info",
-        }));
-        hostBcastSessionList();
-      }
-      break;
-    }
     case "get_saved_sessions": {
       // Stream saved sessions to the requesting client, capped at 100 most recent.
       void (async () => {
@@ -1131,15 +1086,6 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
           ws.send(JSON.stringify({ type: "saved_sessions", sessions: out }));
         }
       })();
-      break;
-    }
-    case "get_state": {
-      hostBcastClients(JSON.stringify({
-        type: "response",
-        command: "get_state",
-        success: true,
-        data: { clients: clientConns.size },
-      }));
       break;
     }
     case "get_sessions": {
@@ -1439,20 +1385,6 @@ export default function (pi: ExtensionAPI) {
     });
   });
 
-  // Game mode: extensionUiGameFrame → raw RGBA pixel data stream
-  // Sent as hex-encoded string to avoid binary WS compat issues
-  pi.on("extensionUiGameFrame", async (e: any) => {
-    if (e.data && e.width && e.height) {
-      const frame = e.data as Uint8Array;
-      emitAgentEvent({
-        type: "game_frame",
-        width: e.width,
-        height: e.height,
-        data: Buffer.from(frame).toString("hex"),
-      });
-    }
-  });
-
   // Generic TUI render protocol: extensionUiRender → raw ANSI text
   // Throttled to ~10fps (DOOM game loop runs at 35+ which would flood the WS)
   let lastRenderBroadcast = 0;
@@ -1480,15 +1412,6 @@ export default function (pi: ExtensionAPI) {
     });
   });
 
-  // Speculative event name; harmless if pi never emits it. Accepts `text` or `value`.
-  pi.on("extensionUiSetEditorText", async (e: any) => {
-    emitAgentEvent({
-      type: "extension_ui_request",
-      method: "set_editor_text",
-      id: "editor",
-      text: e.text ?? e.value ?? "",
-    });
-  });
 
   // ── Status ────────────────────────────────────────────────────────────
 
