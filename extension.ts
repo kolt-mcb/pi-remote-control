@@ -17,7 +17,7 @@
  *   /remote-stop      — stops it
  */
 
-import type { ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { WebSocketServer, WebSocket } from "ws";
 import type { RawData } from "ws";
 import type { IncomingMessage } from "node:http";
@@ -28,10 +28,27 @@ import fs from "node:fs";
 import path from "node:path";
 // Local fork of pi-tui exposes selectListEvents/respondToSelectList so we can
 // surface any SelectList-based selector (built-in or extension) to the phone.
-import { selectListEvents, respondToSelectList } from "@earendil-works/pi-tui";
+// These are NOT in upstream pi; provide no-op stubs so the extension loads everywhere.
+let selectListEvents: {
+  on(event: "mount" | "dismiss", handler: (...args: any[]) => void): void;
+} | null = null;
+let respondToSelectList: ((id: string, value: any) => void) | null = null;
+try {
+  // @ts-ignore — only available in a local fork of pi-tui
+  const tui = require("@earendil-works/pi-tui");
+  if (tui.selectListEvents) selectListEvents = tui.selectListEvents;
+  if (tui.respondToSelectList) respondToSelectList = tui.respondToSelectList;
+} catch {}
+if (!selectListEvents) {
+  // No-op emitter — the mount/dismiss listeners below become no-ops
+  selectListEvents = { on: () => {} };
+}
+if (!respondToSelectList) {
+  respondToSelectList = () => {};
+}
 // BUILTIN_SLASH_COMMANDS used to match supported remote commands (/compact, /quit).
-import { BUILTIN_SLASH_COMMANDS, SessionManager } from "@mariozechner/pi-coding-agent";
-import type { SessionInfo } from "@mariozechner/pi-coding-agent";
+import { BUILTIN_SLASH_COMMANDS, SessionManager } from "@earendil-works/pi-coding-agent";
+import type { SessionInfo } from "@earendil-works/pi-coding-agent";
 import qrcodeTerminal from "qrcode-terminal";
 
 // ── Config ──────────────────────────────────────────────────────────────
@@ -1208,7 +1225,7 @@ export default function (pi: ExtensionAPI) {
   // ── Message renderer ──────────────────────────────────────────────────
 
   pi.registerMessageRenderer("remote", (msg, _opts, theme) => {
-    const { Text } = require("@mariozechner/pi-tui") as typeof import("@mariozechner/pi-tui");
+    const { Text } = require("@earendil-works/pi-tui") as typeof import("@earendil-works/pi-tui");
     return new Text(theme.fg("accent", `[Remote] ${msg.content}`), 0, 0);
   });
 

@@ -1,20 +1,24 @@
 {
   "name": "pi-remote-control",
   "version": "0.1.0",
-  "description": "Pi extension for LAN remote control from phone",
+  "description": "Pi extension for LAN remote control from phone — connect via Android app over WebSocket",
   "type": "module",
-  "keywords": ["pi", "pi-package", "pi-extension", "remote-control", "android"],
+  "homepage": "https://github.com/grunt3714-lgtm/pi-remote-control",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/grunt3714-lgtm/pi-remote-control.git"
+  },
+  "keywords": ["pi", "pi-package", "pi-extension", "remote-control", "android", "websocket", "companion-app"],
+  "license": "MIT",
   "pi": {
-    "extensions": [
-      "./extension.ts"
-    ]
+    "extensions": ["./extension.ts"]
   },
   "dependencies": {
-    "ws": "^8.18.0",
-    "qrcode-terminal": "^0.12.0"
+    "qrcode-terminal": "^0.12.0",
+    "ws": "^8.18.0"
   },
-  "devDependencies": {
-    "@types/ws": "^8.5.0",
-    "@types/qrcode-terminal": "^0.12.2"
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   }
 }

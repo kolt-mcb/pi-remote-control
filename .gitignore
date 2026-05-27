@@ -11,9 +11,18 @@ build/
 *.ipr
 *.iws
 
+# Kotlin
+.kotlin/
+
+# Claude / AI tooling
+.claude/
+
 # Node
 node_modules/
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Pi token (auto-generated, should not be committed)
+# (pi-remote-control.token lives in ~/.pi/agent/, not in the repo)

@@ -1,7 +1,9 @@
 // Throwaway mock pi host to verify on-device rendering of host-supplied
 // ansiLines (the rendered-presentation bridge). Sends a custom message whose
 // `ansiLines` mimic what an extension's Component.render(width) would produce.
-const { WebSocketServer } = require("/home/grunt/pi-remote-control/node_modules/ws");
+// Run from the repo root: `node mock-pi-server.cjs`
+const path = require("path");
+const { WebSocketServer } = require(path.join(__dirname, "node_modules", "ws"));
 const E = "\x1b";
 const fg = (r, g, b, s) => `${E}[38;2;${r};${g};${b}m${s}${E}[39m`;
 const bg = (r, g, b, s) => `${E}[48;2;${r};${g};${b}m${s}${E}[49m`;
