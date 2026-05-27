@@ -50,9 +50,10 @@ Then restart pi.
 
 ## Install — phone side
 
-Side-load the APK from [Releases](../../releases). Versioned APKs are
-published from CI on every push to `master`; the rolling `latest` tag
-always points at the most recent build.
+The Android app lives in its own repo. Side-load the APK from its
+[Releases](https://github.com/grunt3714-lgtm/pi-remote-control-app/releases).
+CI there publishes a versioned APK on every push to `master`; the rolling
+`latest` tag always points at the most recent build.
 
 The first launch will request:
 - **Camera** — for the QR scanner on the connect screen.
@@ -141,13 +142,15 @@ pi -e ./extension.ts
 ```
 
 ### Android app
-Open `android/pi-remote-control-app/` in Android Studio (or run from CLI):
+The app lives in its own repo —
+[`pi-remote-control-app`](https://github.com/grunt3714-lgtm/pi-remote-control-app):
 ```bash
-cd android/pi-remote-control-app
+git clone https://github.com/grunt3714-lgtm/pi-remote-control-app
+cd pi-remote-control-app
 ./gradlew :app:assembleDebug   # or :app:assembleRelease
 ```
-Output: `app/build/outputs/apk/{debug,release}/`. Release builds use
-versionCode = git-commit-count and versionName = short-SHA.
+Output: `app/build/outputs/apk/{debug,release}/`. Builds use
+versionName = short-SHA and versionCode = git-commit-count + 100.
 
 ## Protocol
 

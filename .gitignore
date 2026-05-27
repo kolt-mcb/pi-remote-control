@@ -1,24 +1,8 @@
-# Build
-*/build/
-*/app/build/
-.gradle/
-local.properties
-build/
-
-# IDE
-.idea/
-*.iml
-*.ipr
-*.iws
-
-# Kotlin
-.kotlin/
+# Node
+node_modules/
 
 # Claude / AI tooling
 .claude/
-
-# Node
-node_modules/
 
 # OS
 .DS_Store
