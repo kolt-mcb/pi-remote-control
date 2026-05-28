@@ -896,19 +896,14 @@ function executeSlashLocally(pi: ExtensionAPI, commandName: string, args: string
   } else if (commandName === "quit") {
     void safeCtx(pi, "/quit", async (ctx) => { void ctx.shutdown(); });
   } else if (REMOTE_STALES.has(commandName)) {
-    // The phone is expected to intercept /resume locally and open its
-    // in-place picker (which sends `resume_to` with the chosen path). If
-    // we get here, the app didn't intercept — likely an older build, or
-    // /resume was typed in an input that bypassed the slash menu. Point
-    // the user at the right path.
     const hint =
-      commandName === "resume" ? "use the slash menu (your app should open an in-place picker), or run /resume in the pi terminal"
-      : /* reload */ "run /reload in the pi terminal";
+      commandName === "resume" ? "run /resume in the pi terminal" :
+      /* reload */ "run /reload in the pi terminal";
     hostBcastClients(JSON.stringify({
       type: "extension_ui_request",
       method: "notify",
       id: `notify_stale_path_${Date.now()}`,
-      message: `/${commandName} from the app — ${hint}.`,
+      message: `/${commandName} can't run from the app — ${hint}.`,
       notifyType: "warning",
     }));
   } else {
@@ -1113,33 +1108,6 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
           ws.send(JSON.stringify({ type: "saved_sessions", sessions: out }));
         }
       })();
-      break;
-    }
-    // ── In-place /resume from the phone ────────────────────────────
-    // The phone's slash menu intercepts /resume locally, opens an in-place
-    // picker fed by get_saved_sessions, and sends `resume_to` with the path
-    // the user chose. We call ctx.switchSession on the host: pi tears down
-    // and rebinds for the new session; session_shutdown closes the WS, and
-    // the phone reconnects to the freshly-loaded session.
-    //
-    // Deferred via setImmediate for the same reason as executeInputLine —
-    // awaiting switchSession inside the command-context invalidates the
-    // very context the call runs in.
-    case "resume_to": {
-      const path = typeof cmd.path === "string" ? cmd.path.trim() : "";
-      if (!path) break;
-      hostBcastClients(JSON.stringify({
-        type: "extension_ui_request",
-        method: "notify",
-        id: `notify_resume_${Date.now()}`,
-        message: "Switching session…",
-        notifyType: "info",
-      }));
-      setImmediate(() => {
-        void safeCtx(pi, "/resume", async (ctx) => {
-          await ctx.switchSession(path);
-        });
-      });
       break;
     }
     case "get_sessions": {
