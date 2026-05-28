@@ -110,7 +110,8 @@ const CERT_FILE = path.join(process.env.HOME || ".", ".pi", "agent", "pi-remote-
 const KEY_FILE  = path.join(process.env.HOME || ".", ".pi", "agent", "pi-remote-control.key");
 
 type TlsSource = "loaded" | "generated";
-function resolveTlsCert(): { cert: string; key: string; source: TlsSource } {
+// `selfsigned.generate` is async in v5+ (returns a Promise) — must await.
+async function resolveTlsCert(): Promise<{ cert: string; key: string; source: TlsSource }> {
   try {
     if (fs.existsSync(CERT_FILE) && fs.existsSync(KEY_FILE)) {
       const cert = fs.readFileSync(CERT_FILE, "utf8");
@@ -125,21 +126,31 @@ function resolveTlsCert(): { cert: string; key: string; source: TlsSource } {
   // Long-dated self-signed cert. Expiry is mostly cosmetic for a TOFU
   // fingerprint-pinned cert; if it ever does expire, deleting the files and
   // restarting pi mints a new one.
-  const pems = selfsigned.generate(
+  const pems: any = await selfsigned.generate(
     [{ name: "commonName", value: "pi-remote-control" }],
     { keySize: 2048, days: 36500, algorithm: "sha256" },
   );
+  // selfsigned v5 returns { cert, private, public, fingerprint } — match either name
+  // for `key` defensively in case minor versions wobble.
+  const certPem: string | undefined = pems?.cert;
+  const keyPem:  string | undefined = pems?.private ?? pems?.key;
+  if (!certPem || !keyPem) {
+    throw new Error(`selfsigned.generate returned an unexpected shape: keys=${Object.keys(pems ?? {}).join(",")}`);
+  }
   try {
     fs.mkdirSync(path.dirname(CERT_FILE), { recursive: true });
-    fs.writeFileSync(CERT_FILE, pems.cert,    { mode: 0o600 });
-    fs.writeFileSync(KEY_FILE,  pems.private, { mode: 0o600 });
+    fs.writeFileSync(CERT_FILE, certPem, { mode: 0o600 });
+    fs.writeFileSync(KEY_FILE,  keyPem,  { mode: 0o600 });
   } catch (e: any) {
     console.warn(`pi-remote-control: couldn't persist TLS cert/key to ${path.dirname(CERT_FILE)}: ${e?.message ?? e}`);
   }
-  return { cert: pems.cert, key: pems.private, source: "generated" };
+  return { cert: certPem, key: keyPem, source: "generated" };
 }
 
-const TLS = resolveTlsCert();
+// Top-level await: pi loads extensions as ESM (package.json type=module), so
+// blocking module init on cert generation is fine and keeps every downstream
+// call (urlWithToken, startHost, etc.) plain synchronous.
+const TLS = await resolveTlsCert();
 // SHA-256 of the DER (binary) form of the cert. Hex, lowercase, 64 chars.
 const TLS_FINGERPRINT = createHash("sha256")
   .update(Buffer.from(
