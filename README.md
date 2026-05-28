@@ -24,7 +24,7 @@ SDKs. The phone talks directly to your pi over `ws://`. A
 Pi installs the extension from this repo's git URL:
 
 ```bash
-pi install git:github.com/grunt3714-lgtm/pi-remote-control
+pi install git:github.com/kolt-mcb/pi-remote-control
 ```
 
 After that, every `pi` launch loads the extension automatically. The WS
@@ -44,7 +44,7 @@ Scan the QR from the Android app to connect.
 
 To update later:
 ```bash
-pi update git:github.com/grunt3714-lgtm/pi-remote-control
+pi update git:github.com/kolt-mcb/pi-remote-control
 ```
 Then restart pi.
 
@@ -133,7 +133,7 @@ invalid.
 
 ### Extension
 ```bash
-git clone https://github.com/grunt3714-lgtm/pi-remote-control
+git clone https://github.com/kolt-mcb/pi-remote-control
 cd pi-remote-control
 npm install
 # Run pi with the extension loaded directly (won't survive pi restarts):
