@@ -901,11 +901,16 @@ function showResumePicker(pi: ExtensionAPI): void {
   let sessions: SessionInfo[] = [];
   let unsub: (() => void) | null = null;
 
-  const push = (lines: string[], dismiss = false): void => {
+  // `tapValues` is a parallel array to `lines`: any non-empty entry marks
+  // that line as tappable on the phone, and the entry is the string sent
+  // back via sendInput. Older app builds ignore the field — they still see
+  // the same numbered list and can type the number.
+  const push = (lines: string[], tapValues: string[], dismiss = false): void => {
     hostBcastClients(JSON.stringify({
       type: "render",
       id: renderId,
       lines,
+      tapValues,
       inputMode: "text",
       title: "Resume session",
       dismiss: dismiss || lines.length === 0,
@@ -913,26 +918,30 @@ function showResumePicker(pi: ExtensionAPI): void {
   };
 
   const dismiss = (): void => {
-    push([], true);
+    push([], [], true);
     if (unsub) { unsub(); unsub = null; }
   };
 
   const rerender = (footer?: string): void => {
-    const lines: string[] = [""];
+    const lines: string[] = [];
+    const tapValues: string[] = [];
+    const add = (line: string, tap = ""): void => { lines.push(line); tapValues.push(tap); };
+
+    add("");
     if (sessions.length === 0) {
-      lines.push("  Loading saved sessions…");
+      add("  Loading saved sessions…");
     } else {
       sessions.forEach((s, i) => {
         const idx = String(i + 1).padStart(2, " ");
         const name = (s.name?.trim() || s.firstMessage?.trim() || s.id || "session")
           .replace(/\s+/g, " ").slice(0, 38);
         const ago = formatAgo(s.modified);
-        lines.push(`  ${idx}. ${name.padEnd(40)} ${ago}`);
+        add(`  ${idx}. ${name.padEnd(40)} ${ago}`, String(i + 1));
       });
     }
-    lines.push("");
-    lines.push(footer ?? "  Type a number to resume, or `q` to cancel.");
-    push(lines);
+    add("");
+    add(footer ?? "  Tap a row to resume, or type a number. `q` to cancel.");
+    push(lines, tapValues);
   };
 
   // First frame goes out immediately so the picker appears on the phone
