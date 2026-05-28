@@ -507,9 +507,11 @@ function sendCurrentTheme(ws: WebSocket): void {
 // selectors — which surface on the phone through the SelectList bridge — while
 // output commands (/copy, /export, /share) run on the host machine.
 //
-// The exceptions below REPLACE the session and would invalidate this
-// extension's runtime, so they're routed to safe alternatives instead.
-const REMOTE_STALES = new Set(["resume", "reload"]);
+// /reload would tear down and rebind the extension runtime, which would
+// invalidate the command-context the call runs in, so route it to a notice
+// for now. /resume gets its own in-extension text render-frame picker (see
+// showResumePicker) and is intentionally NOT in this set.
+const REMOTE_STALES = new Set(["reload"]);
 
 // All built-ins are offered to the phone so the menu mirrors pi's own.
 function buildCommandList(): { name: string; description: string }[] {
@@ -872,11 +874,118 @@ function stop(pi: ExtensionAPI): void {
   console.log("[pi-remote-control] stopped");
 }
 
+// ── /resume picker (text render-frame) ──────────────────────────────
+// Pi's /resume opens a custom SessionSelectorComponent which we can't mirror
+// via the SelectList bridge. Instead, render our own numbered list as an ANSI
+// text frame and read the user's choice back through the existing render/input
+// wire protocol. The phone already handles `inputMode: "text"` (it shows the
+// frame and a text input), so this works with no Android changes.
+function formatAgo(modified: unknown): string {
+  const ts = typeof modified === "number"
+    ? modified
+    : (Date.parse(String(modified)) || Date.now());
+  const seconds = Math.max(0, (Date.now() - ts) / 1000);
+  if (seconds < 60) return `${Math.floor(seconds)}s`;
+  const minutes = seconds / 60;
+  if (minutes < 60) return `${Math.floor(minutes)}m`;
+  const hours = minutes / 60;
+  if (hours < 24) return `${Math.floor(hours)}h`;
+  const days = hours / 24;
+  if (days < 30) return `${Math.floor(days)}d`;
+  const months = days / 30;
+  return `${Math.floor(months)}mo`;
+}
+
+function showResumePicker(pi: ExtensionAPI): void {
+  const renderId = `resume_${Date.now().toString(36)}`;
+  let sessions: SessionInfo[] = [];
+  let unsub: (() => void) | null = null;
+
+  const push = (lines: string[], dismiss = false): void => {
+    hostBcastClients(JSON.stringify({
+      type: "render",
+      id: renderId,
+      lines,
+      inputMode: "text",
+      title: "Resume session",
+      dismiss: dismiss || lines.length === 0,
+    }));
+  };
+
+  const dismiss = (): void => {
+    push([], true);
+    if (unsub) { unsub(); unsub = null; }
+  };
+
+  const rerender = (footer?: string): void => {
+    const lines: string[] = [""];
+    if (sessions.length === 0) {
+      lines.push("  Loading saved sessions…");
+    } else {
+      sessions.forEach((s, i) => {
+        const idx = String(i + 1).padStart(2, " ");
+        const name = (s.name?.trim() || s.firstMessage?.trim() || s.id || "session")
+          .replace(/\s+/g, " ").slice(0, 38);
+        const ago = formatAgo(s.modified);
+        lines.push(`  ${idx}. ${name.padEnd(40)} ${ago}`);
+      });
+    }
+    lines.push("");
+    lines.push(footer ?? "  Type a number to resume, or `q` to cancel.");
+    push(lines);
+  };
+
+  // First frame goes out immediately so the picker appears on the phone
+  // as soon as the user taps /resume, even before the listAll completes.
+  rerender();
+
+  // Filter incoming inputs by renderId; the inputListeners bus is shared
+  // with anything else using the render protocol (e.g. a future extension).
+  const handler = (id: string, value: string): void => {
+    if (id !== renderId) return;
+    const v = value.trim().toLowerCase();
+    if (!v || v === "q" || v === "cancel" || v === "esc") { dismiss(); return; }
+    const n = parseInt(v, 10);
+    if (!Number.isFinite(n) || n < 1 || n > sessions.length) {
+      const max = sessions.length || 0;
+      rerender(`  ✗ no session #${value.trim()}. Type 1–${max}, or 'q' to cancel.`);
+      return;
+    }
+    const path = sessions[n - 1].path;
+    dismiss();
+    // Defer like ctx.executeInputLine — switchSession tears down and rebinds
+    // the runtime, which would invalidate the command-context we're inside.
+    // session_shutdown fires, the WS closes, the phone reconnects.
+    setImmediate(() => {
+      void safeCtx(pi, "/resume", async (ctx) => {
+        await ctx.switchSession(path);
+      });
+    });
+  };
+  inputListeners.push(handler);
+  unsub = () => {
+    const i = inputListeners.indexOf(handler);
+    if (i !== -1) inputListeners.splice(i, 1);
+  };
+
+  void (async () => {
+    try {
+      const list = await SessionManager.listAll();
+      list.sort((a, b) => +new Date(b.modified) - +new Date(a.modified));
+      sessions = list.slice(0, 100);
+      rerender();
+    } catch (e: any) {
+      rerender(`  failed to load saved sessions: ${e?.message ?? e}`);
+    }
+  })();
+}
+
 // Run a slash command against THIS pi's own session. Used both for commands
 // the phone targets at our self agent and for ones forwarded to us as a peer
 // (route_slash_command). /compact and /quit use dedicated context actions;
-// /resume and /reload are routed to notices; everything else (incl. /new) goes
-// through pi's editor submit path via ctx.executeInputLine.
+// /resume opens the in-extension text render-frame picker (above); /reload is
+// routed to a notice; everything else (incl. /new) goes through pi's editor
+// submit path via ctx.executeInputLine.
 function executeSlashLocally(pi: ExtensionAPI, commandName: string, args: string): void {
   if (commandName === "compact") {
     const instructions = args.trim();
@@ -895,15 +1004,16 @@ function executeSlashLocally(pi: ExtensionAPI, commandName: string, args: string
     })();
   } else if (commandName === "quit") {
     void safeCtx(pi, "/quit", async (ctx) => { void ctx.shutdown(); });
+  } else if (commandName === "resume") {
+    showResumePicker(pi);
   } else if (REMOTE_STALES.has(commandName)) {
-    const hint =
-      commandName === "resume" ? "run /resume in the pi terminal" :
-      /* reload */ "run /reload in the pi terminal";
+    // /reload only — would tear down + rebind the runtime mid-call; punt to a
+    // notice so the user knows to run it from the terminal.
     hostBcastClients(JSON.stringify({
       type: "extension_ui_request",
       method: "notify",
       id: `notify_stale_path_${Date.now()}`,
-      message: `/${commandName} can't run from the app — ${hint}.`,
+      message: `/${commandName} can't run from the app — run /${commandName} in the pi terminal.`,
       notifyType: "warning",
     }));
   } else {
