@@ -8,13 +8,24 @@
     "type": "git",
     "url": "https://github.com/kolt-mcb/pi-remote-control.git"
   },
-  "keywords": ["pi", "pi-package", "pi-extension", "remote-control", "android", "websocket", "companion-app"],
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "remote-control",
+    "android",
+    "websocket",
+    "companion-app"
+  ],
   "license": "MIT",
   "pi": {
-    "extensions": ["./extension.ts"]
+    "extensions": [
+      "./extension.ts"
+    ]
   },
   "dependencies": {
     "qrcode-terminal": "^0.12.0",
+    "selfsigned": "^5.5.0",
     "ws": "^8.18.0"
   },
   "peerDependencies": {

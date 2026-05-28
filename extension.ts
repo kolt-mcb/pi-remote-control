@@ -21,11 +21,13 @@ import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { WebSocketServer, WebSocket } from "ws";
 import type { RawData } from "ws";
 import type { IncomingMessage } from "node:http";
+import https from "node:https";
 import os from "node:os";
-import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { spawn as spawnChild } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import selfsigned from "selfsigned";
 // Local fork of pi-tui exposes selectListEvents/respondToSelectList so we can
 // surface any SelectList-based selector (built-in or extension) to the phone.
 // These are NOT in upstream pi; provide no-op stubs so the extension loads everywhere.
@@ -97,6 +99,58 @@ function resolveToken(): { token: string; source: TokenSource; tokenFile: string
 }
 const { token: AUTH_TOKEN, source: AUTH_TOKEN_SOURCE, tokenFile: AUTH_TOKEN_FILE } = resolveToken();
 
+// TLS cert + key. The WS server runs as `wss://` with a self-signed cert that's
+// generated on first launch and persisted alongside the token. The cert's
+// SHA-256 fingerprint is embedded in the printed URL + QR; the phone pins that
+// fingerprint at scan time and refuses any other cert. TOFU-style — no public
+// CA, no hostname matching needed (we connect by IP). Rotate by deleting the
+// .crt and .key files and restarting pi: a fresh cert is minted and the next
+// QR carries its new fingerprint.
+const CERT_FILE = path.join(process.env.HOME || ".", ".pi", "agent", "pi-remote-control.crt");
+const KEY_FILE  = path.join(process.env.HOME || ".", ".pi", "agent", "pi-remote-control.key");
+
+type TlsSource = "loaded" | "generated";
+function resolveTlsCert(): { cert: string; key: string; source: TlsSource } {
+  try {
+    if (fs.existsSync(CERT_FILE) && fs.existsSync(KEY_FILE)) {
+      const cert = fs.readFileSync(CERT_FILE, "utf8");
+      const key  = fs.readFileSync(KEY_FILE, "utf8");
+      if (cert.includes("BEGIN CERTIFICATE") && key.includes("BEGIN")) {
+        return { cert, key, source: "loaded" };
+      }
+    }
+  } catch (e: any) {
+    console.warn(`pi-remote-control: failed to read TLS cert/key (${e?.message ?? e}) — regenerating`);
+  }
+  // Long-dated self-signed cert. Expiry is mostly cosmetic for a TOFU
+  // fingerprint-pinned cert; if it ever does expire, deleting the files and
+  // restarting pi mints a new one.
+  const pems = selfsigned.generate(
+    [{ name: "commonName", value: "pi-remote-control" }],
+    { keySize: 2048, days: 36500, algorithm: "sha256" },
+  );
+  try {
+    fs.mkdirSync(path.dirname(CERT_FILE), { recursive: true });
+    fs.writeFileSync(CERT_FILE, pems.cert,    { mode: 0o600 });
+    fs.writeFileSync(KEY_FILE,  pems.private, { mode: 0o600 });
+  } catch (e: any) {
+    console.warn(`pi-remote-control: couldn't persist TLS cert/key to ${path.dirname(CERT_FILE)}: ${e?.message ?? e}`);
+  }
+  return { cert: pems.cert, key: pems.private, source: "generated" };
+}
+
+const TLS = resolveTlsCert();
+// SHA-256 of the DER (binary) form of the cert. Hex, lowercase, 64 chars.
+const TLS_FINGERPRINT = createHash("sha256")
+  .update(Buffer.from(
+    TLS.cert
+      .replace(/-----BEGIN CERTIFICATE-----/g, "")
+      .replace(/-----END CERTIFICATE-----/g, "")
+      .replace(/\s+/g, ""),
+    "base64",
+  ))
+  .digest("hex");
+
 function authOk(provided: string): boolean {
   if (!AUTH_TOKEN) return true;
   // Length mismatch can't be timing-safe and isn't a meaningful secret; bail early.
@@ -104,10 +158,16 @@ function authOk(provided: string): boolean {
   return timingSafeEqual(Buffer.from(provided), Buffer.from(AUTH_TOKEN));
 }
 
+// Build the connect URL: appends ?token=... (when auth is on) and the cert
+// fingerprint ?fp=<sha256>. The phone pins by fp; the token gates connection
+// auth on top. With NO_AUTH=1, fp is still attached so the channel can be
+// encrypted even without authn.
 function urlWithToken(base: string): string {
-  if (!AUTH_TOKEN) return base;
+  const params: string[] = [];
+  if (AUTH_TOKEN) params.push(`token=${encodeURIComponent(AUTH_TOKEN)}`);
+  params.push(`fp=${TLS_FINGERPRINT}`);
   const sep = base.includes("?") ? "&" : "?";
-  return `${base}${sep}token=${encodeURIComponent(AUTH_TOKEN)}`;
+  return `${base}${sep}${params.join("&")}`;
 }
 
 function tokenFromReqUrl(reqUrl: string | undefined): string {
@@ -157,6 +217,7 @@ let mode: Mode = "stopped";
 // handlers route to `currentPi`, which each freshly-loaded instance updates.
 interface RCTransport {
   wss: WebSocketServer | null;
+  httpsServer: https.Server | null;
   clientConns: Set<WebSocket>;
   peerConns: Map<string, WebSocket>;
   wsToPeerId: WeakMap<WebSocket, string>;
@@ -166,6 +227,7 @@ interface RCTransport {
 }
 const RC: RCTransport = ((globalThis as any).__piRemoteTransport ??= {
   wss: null,
+  httpsServer: null,
   clientConns: new Set<WebSocket>(),
   peerConns: new Map<string, WebSocket>(),
   wsToPeerId: new WeakMap<WebSocket, string>(),
@@ -627,26 +689,31 @@ function parseNameFromUrl(reqUrl: string | undefined, fallback: string): string 
 
 function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
   const ip = localIP();
-  const url = urlWithToken(`ws://${ip}:${DEFAULT_PORT}`);
+  const url = urlWithToken(`wss://${ip}:${DEFAULT_PORT}`);
 
-  const server = new WebSocketServer({ port: DEFAULT_PORT, host: "0.0.0.0" });
+  // TLS terminates here. The WebSocketServer hooks into the https server's
+  // 'upgrade' event for us; events that used to come from WebSocketServer
+  // (error / listening) now come from the underlying https server.
+  const httpsServer = https.createServer({ cert: TLS.cert, key: TLS.key });
+  const server = new WebSocketServer({ server: httpsServer });
   RC.wss = server;
+  RC.httpsServer = httpsServer;
 
   let bound = false;
   let bindFailed = false;
 
-  // ws emits EADDRINUSE asynchronously — before we can finish setup
-  server.on("error", (err: any) => {
+  httpsServer.on("error", (err: any) => {
     if (err?.code === "EADDRINUSE") {
       bindFailed = true;
       RC.wss = null;
-      try { server.close(); } catch { /* ignore */ }
+      RC.httpsServer = null;
+      try { httpsServer.close(); } catch { /* ignore */ }
       onBindFail();
     }
-    // any other ws error — ignore, 'connection' handles per-client errors
+    // any other https error — ignore, 'connection' handles per-client errors
   });
 
-  server.on("listening", () => {
+  httpsServer.on("listening", () => {
     if (bindFailed) return;
     bound = true;
     mode = "host";
@@ -669,6 +736,13 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
         console.log(`  auth: DISABLED (PI_REMOTE_CONTROL_NO_AUTH=1). Anyone who can reach this port can drive the agent.`);
         break;
     }
+    // Channel encryption: self-signed TLS, pinned by SHA-256 fingerprint in the QR.
+    // Show a short prefix so the user can eyeball-compare with the phone if needed;
+    // the full fingerprint is in the URL.
+    const fpShort = `${TLS_FINGERPRINT.slice(0, 8)}…${TLS_FINGERPRINT.slice(-8)}`;
+    const certSrc = TLS.source === "loaded" ? CERT_FILE : `NEW self-signed cert generated and stored at ${CERT_FILE}`;
+    console.log(`  tls:  ${certSrc}`);
+    console.log(`  fingerprint: sha256:${fpShort} (full value pinned in the QR)`);
     console.log();
     // Render a QR code the Android app can scan. The Android scanner accepts
     // ws://, wss://, piremote://, and bare host:port; we use ws:// so a
@@ -742,10 +816,15 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
     if (!bound && !bindFailed) {
       bindFailed = true;
       RC.wss = null;
-      try { server.close(); } catch { /* ignore */ }
+      RC.httpsServer = null;
+      try { httpsServer.close(); } catch { /* ignore */ }
       onBindFail();
     }
   }, 1500);
+
+  // Now actually start listening. With `new WebSocketServer({ server })` the
+  // listen call must come from the underlying http(s) server, not the WS lib.
+  httpsServer.listen(DEFAULT_PORT, "0.0.0.0");
 }
 
 // ── Peer-mode lifecycle ─────────────────────────────────────────────────
@@ -755,10 +834,17 @@ function startPeer(pi: ExtensionAPI): void {
   mode = "peer";
   // Same shared secret applies for host↔peer on the loopback. If PI_REMOTE_TOKEN
   // is set, the peer dials with the token so the host's auth gate accepts it.
-  const url = urlWithToken(`ws://127.0.0.1:${DEFAULT_PORT}`);
+  // wss:// with the local self-signed cert: we pass our cert as the trusted CA
+  // and disable hostname verification (we're connecting to 127.0.0.1 with a
+  // cert whose CN is "pi-remote-control", not an IP/hostname match). This is
+  // equivalent to fingerprint-pinning since the cert is *the* local file.
+  const url = urlWithToken(`wss://127.0.0.1:${DEFAULT_PORT}`);
   refreshRemoteStatus(); // "remote · connecting…" in the footer (peerSock still null)
 
-  const sock = new WebSocket(url);
+  const sock = new WebSocket(url, {
+    ca: TLS.cert,
+    checkServerIdentity: () => undefined,
+  });
   peerSock = sock;
 
   sock.on("open", () => {
@@ -850,6 +936,9 @@ function stop(pi: ExtensionAPI): void {
 
   if (wasMode === "host" && RC.wss) {
     RC.wss.close();
+    // Close the underlying https listener too, otherwise the port stays bound.
+    try { RC.httpsServer?.close(); } catch { /* ignore */ }
+    RC.httpsServer = null;
     for (const ws of clientConns) {
       try { ws.close(); } catch { /* ignore */ }
     }
