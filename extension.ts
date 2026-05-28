@@ -713,16 +713,25 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
   let bound = false;
   let bindFailed = false;
 
-  httpsServer.on("error", (err: any) => {
-    if (err?.code === "EADDRINUSE") {
+  // ws v8 attaches its own listener to `httpsServer.on("error")` that
+  // re-emits on the WebSocketServer instance. If WSS has no listener, that
+  // re-emit throws synchronously (default EventEmitter behaviour) BEFORE my
+  // httpsServer listener gets a turn — so the EADDRINUSE escapes as an
+  // uncaughtException and the second-pi-on-the-same-port falls flat instead
+  // of switching to peer mode. Handler must be on `server` (the WSS) to
+  // catch the re-emit; mirror on httpsServer for completeness.
+  const onServerError = (err: any) => {
+    if (err?.code === "EADDRINUSE" && !bindFailed) {
       bindFailed = true;
       RC.wss = null;
       RC.httpsServer = null;
       try { httpsServer.close(); } catch { /* ignore */ }
       onBindFail();
     }
-    // any other https error — ignore, 'connection' handles per-client errors
-  });
+    // any other error — ignore; 'connection' handles per-client errors
+  };
+  server.on("error", onServerError);
+  httpsServer.on("error", onServerError);
 
   httpsServer.on("listening", () => {
     if (bindFailed) return;
