@@ -1,25 +1,22 @@
-# Pi Remote Control
+# pi-remote-control
 
-An unofficial Android companion app for [pi](https://github.com/badlogic/pi-mono),
-a CLI coding agent. Drives your pi from your phone over LAN. Two parts:
+A [pi](https://github.com/badlogic/pi-mono) extension that exposes a live pi
+session over a LAN WebSocket so a remote client can drive it. The reference
+client is the Android app at
+[`kolt-mcb/pi-remote-control-app`](https://github.com/kolt-mcb/pi-remote-control-app);
+the protocol is plain WS + JSON, so anything that can speak it works.
 
-- **A pi extension** that runs inside your pi process, exposes a WebSocket
-  server on `0.0.0.0:8765`, and forwards agent events to connected clients.
-- **An Android app** that connects to that WS, renders the chat in a
-  pi-terminal-styled UI, and lets you prompt / steer / follow-up just like
-  you would in the terminal.
-
-LAN-only by design — there's no cloud relay, no telemetry, no third-party
-SDKs. The phone talks directly to your pi over `ws://`. A
-[shared-secret token](#auth) gates access.
+LAN-only by design — no cloud relay, no telemetry, no third-party SDKs. The
+phone (or other client) talks directly to your pi over `ws://`, and a
+[shared-secret token](#auth) gates every connection.
 
 | | |
 |---|---|
 | **Status** | Early. Solo-author project. APIs and storage formats may change between commits. |
 | **License** | MIT — see [LICENSE](LICENSE). |
-| **Privacy** | No analytics, no remote logging, no SDK callbacks. Network traffic is exactly: the pi WS server you connect to, and GitHub Releases (for the in-app updater). |
+| **Privacy** | No analytics, no remote logging, no SDK callbacks. Network traffic is exactly: the pi WS server the client connects to. |
 
-## Install — host side
+## Install
 
 Pi installs the extension from this repo's git URL:
 
@@ -40,28 +37,22 @@ server starts on `session_start` and prints its URL + a QR code:
 [ ... QR code ... ]
 ```
 
-Scan the QR from the Android app to connect.
-
-To update later:
+Update later:
 ```bash
 pi update git:github.com/kolt-mcb/pi-remote-control
 ```
+
 Then restart pi.
 
-## Install — phone side
+## Phone client
 
-The Android app lives in its own repo. Side-load the APK from its
-[Releases](https://github.com/grunt3714-lgtm/pi-remote-control-app/releases).
-CI there publishes a versioned APK on every push to `master`; the rolling
-`latest` tag always points at the most recent build.
-
-The first launch will request:
-- **Camera** — for the QR scanner on the connect screen.
-- **Notifications** — for the foreground-service indicator while connected,
-  and one-shot "pi is ready" alerts when a turn finishes in the background.
-
-You can also type the URL manually if you're already on the host and can
-read the printed URL.
+Side-load the Android app from its
+[Releases](https://github.com/kolt-mcb/pi-remote-control-app/releases) and
+scan the QR the extension prints. Setup details, features, and build
+instructions live in the
+[`pi-remote-control-app`](https://github.com/kolt-mcb/pi-remote-control-app)
+repo. The connect screen also lets you paste the WS URL manually if you can
+read it off the host.
 
 ## Auth
 
@@ -87,30 +78,6 @@ To rotate the token: delete `~/.pi/agent/pi-remote-control.token` and
 restart pi. A fresh one will be generated and previous QRs/URLs become
 invalid.
 
-## What the app can do
-
-- Live chat with pi over the LAN, including streaming text and thinking blocks.
-- Inline diff rendering for `edit` / `multiEdit` / `write` tool calls.
-- Per-message tool details (args, result excerpts, expand-on-tap full output).
-- Image attachments — pick from the gallery, sent inline with your prompt.
-- Steer / follow-up — interrupt a running turn or queue a follow-up.
-- Multiple connected pis as parallel tabs (peer-mode).
-- "New session" button spawns a fresh `pi` process on the host so you can
-  have multiple independent conversations in parallel tabs.
-- "Saved sessions" browser — resume any previous pi session as a new tab.
-- Notifications: a persistent "connected" indicator + one-shot "pi is
-  ready" alerts when turns finish while the app is backgrounded.
-
-## What it doesn't do (yet)
-
-- No end-to-end encryption beyond `ws://` (deliberate — see
-  [security notes](#security-notes)).
-- No remote-over-WAN out of the box. If you want it, terminate TLS at a
-  reverse proxy and either tunnel (Tailscale, WireGuard) or front the WS
-  with your own auth layer.
-- No Play Store / F-Droid distribution. Side-load only.
-- No iOS client. (The protocol is plain WS + JSON; a port is welcome.)
-
 ## Security notes
 
 - The WS server binds `0.0.0.0` because that's required for the phone to
@@ -123,15 +90,12 @@ invalid.
 - For untrusted networks, either:
   - Use Tailscale / WireGuard so the LAN becomes a private overlay, or
   - Front the WS with a reverse proxy doing TLS termination and adjust the
-    app's connect URL to `wss://...`.
+    client to connect with `wss://...`.
 - The extension is the only attack surface on the host side. There's no
   daemon outside pi's process; killing pi takes the server down.
-- The Android app's `TestReceiver` (for ADB-driven testing) is `exported=true`
-  in debug builds only — release APKs do not register it.
 
 ## Build from source
 
-### Extension
 ```bash
 git clone https://github.com/kolt-mcb/pi-remote-control
 cd pi-remote-control
@@ -140,17 +104,6 @@ npm install
 pi -e ./extension.ts
 # Or `pi install` it once, then plain `pi`.
 ```
-
-### Android app
-The app lives in its own repo —
-[`pi-remote-control-app`](https://github.com/grunt3714-lgtm/pi-remote-control-app):
-```bash
-git clone https://github.com/grunt3714-lgtm/pi-remote-control-app
-cd pi-remote-control-app
-./gradlew :app:assembleDebug   # or :app:assembleRelease
-```
-Output: `app/build/outputs/apk/{debug,release}/`. Builds use
-versionName = short-SHA and versionCode = git-commit-count + 100.
 
 ## Protocol
 
@@ -163,10 +116,12 @@ If you want to write your own client, the WS messages are documented in
 | `{type:"prompt", message, images?, targetAgentId?}` | send a user message |
 | `{type:"steer", message, ...}` | interrupt current turn with a steer |
 | `{type:"follow_up", message, ...}` | queue a follow-up for next turn |
+| `{type:"slash_command", command, args?, targetAgentId?}` | run a `/command` |
 | `{type:"spawn_peer", sessionPath?}` | spawn a new pi as peer (optionally resuming a saved session) |
 | `{type:"get_saved_sessions"}` | request the saved-session list |
 | `{type:"get_sessions"}` | request the connected-agent list |
 | `{type:"get_commands"}` | request the slash-command list |
+| `{type:"input", id, value}` | answer a render-frame menu (see `piRemote.render`) |
 
 | host → client | meaning |
 |---|---|
@@ -176,6 +131,9 @@ If you want to write your own client, the WS messages are documented in
 | `{type:"session_list", sessions:[...]}` | connected agents |
 | `{type:"saved_sessions", sessions:[...]}` | response to `get_saved_sessions` |
 | `{type:"command_list", commands:[...]}` | response to `get_commands` |
+| `{type:"render", id, lines, inputMode, tapValues?, title?, dismiss?}` | ANSI render frame for a TUI component or in-extension menu |
+| `{type:"extension_ui_request", method, id, ...}` | dialogs/notifications driven by an extension's `pi.ui` API |
+| `{type:"theme_info", theme}` | the active pi theme palette so the client can mirror colors |
 
 ## Contributing
 
@@ -188,6 +146,5 @@ changes by a few days.
 - [pi-coding-agent](https://github.com/badlogic/pi-mono) by Mario Zechner —
   the CLI agent this extension hooks into.
 - [pi-tui](https://github.com/badlogic/pi-mono/tree/main/packages/tui) —
-  the TUI framework whose terminal aesthetic the Android UI mirrors.
-- [dev.snipme:highlights](https://github.com/SnipMeDev/Highlights) — the
-  Kotlin syntax highlighter used for fenced code blocks in chat.
+  the TUI framework whose `SelectList` lifecycle hooks make the phone-side
+  selector mirroring possible.
