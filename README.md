@@ -7,14 +7,15 @@ client is the Android app at
 the protocol is plain WS + JSON, so anything that can speak it works.
 
 LAN-only by design — no cloud relay, no telemetry, no third-party SDKs. The
-phone (or other client) talks directly to your pi over `ws://`, and a
-[shared-secret token](#auth) gates every connection.
+phone (or other client) talks directly to your pi over `wss://` with a
+self-signed cert that's [pinned by SHA-256 fingerprint](#security-notes) in
+the QR, and a [shared-secret token](#auth) gates every connection on top.
 
 | | |
 |---|---|
 | **Status** | Early. Solo-author project. APIs and storage formats may change between commits. |
 | **License** | MIT — see [LICENSE](LICENSE). |
-| **Privacy** | No analytics, no remote logging, no SDK callbacks. Network traffic is exactly: the pi WS server the client connects to. |
+| **Privacy** | No analytics, no remote logging, no SDK callbacks. Network traffic is exactly: the pi WS server the client connects to, end-to-end TLS-encrypted with a pinned self-signed cert. |
 
 ## Install
 
@@ -28,10 +29,12 @@ After that, every `pi` launch loads the extension automatically. The WS
 server starts on `session_start` and prints its URL + a QR code:
 
 ```
-┌─ Pi Remote Control (host) ──────────────────┐
-│  ws://192.168.1.42:8765/?token=...           │
-└─────────────────────────────────────────────┘
+┌─ Pi Remote Control (host) ───────────────────────────────────────────┐
+│  wss://192.168.1.42:8765/?token=…32hex…&fp=…64hex…                   │
+└──────────────────────────────────────────────────────────────────────┘
   auth: shared-secret token from /home/you/.pi/agent/pi-remote-control.token
+  tls:  /home/you/.pi/agent/pi-remote-control.crt
+  fingerprint: sha256:abcd1234…ef905678 (full value pinned in the QR)
 █▀▀▀▀▀█  ▄ █ ▄▄ █▀▀▀▀▀█
 █ ███ █ ▀ ▄▀█ ▄ █ ███ █
 [ ... QR code ... ]
@@ -61,9 +64,10 @@ generates one and persists it to `~/.pi/agent/pi-remote-control.token`
 (mode 0600). Subsequent launches reuse it, so a QR your phone scanned today
 keeps working tomorrow.
 
-The token is included in the printed URL/QR:
+The token is included in the printed URL/QR alongside the cert fingerprint
+(see [Security notes](#security-notes) for what `fp` is doing):
 ```
-ws://your-host:8765/?token=<32 hex chars>
+wss://your-host:8765/?token=<32 hex chars>&fp=<64 hex chars sha256>
 ```
 Connections without a matching `?token=…` are closed with WS code `4001`.
 
@@ -80,17 +84,27 @@ invalid.
 
 ## Security notes
 
+- **Transport is TLS by default — pinned, not CA-trusted.** The extension
+  mints a self-signed 2048-bit RSA cert on first launch and persists it at
+  `~/.pi/agent/pi-remote-control.{crt,key}` (mode 0600); the WS server runs
+  as `wss://`. The cert's SHA-256 fingerprint is embedded in the printed URL
+  and QR (`?fp=<64 hex chars>`), and the client pins it on scan. Any cert
+  whose fingerprint doesn't match is rejected — so even a same-LAN attacker
+  who can sniff packets sees only opaque TLS records, and a MITM with a
+  stolen IP can't substitute their own cert (no CA-trust chain to subvert).
+  Token auth still gates connection on top.
+- **Rotating the cert.** Delete both `pi-remote-control.crt` and
+  `pi-remote-control.key` from `~/.pi/agent/` and restart pi. A fresh cert is
+  generated; the next QR carries the new fingerprint and previously-scanned
+  clients need to scan again. Same shape as token rotation.
 - The WS server binds `0.0.0.0` because that's required for the phone to
   reach it from another LAN host. If your machine has multiple interfaces
   (including a hostile one like a coffee-shop wifi), it'll listen on all of
-  them.
-- Cleartext `ws://` over LAN is the design. The shared-secret token prevents
-  unauthorized connections; it doesn't encrypt traffic. Anyone on the same
-  LAN sniffing packets sees the prompts and responses in plaintext.
-- For untrusted networks, either:
-  - Use Tailscale / WireGuard so the LAN becomes a private overlay, or
-  - Front the WS with a reverse proxy doing TLS termination and adjust the
-    client to connect with `wss://...`.
+  them. The fingerprint pin still protects the channel, but the port is
+  publicly reachable on whatever interfaces are up.
+- WAN access isn't built in. To drive pi over the internet, put it behind
+  Tailscale / WireGuard / an SSH tunnel — the existing TLS + token still
+  apply inside the tunnel.
 - The extension is the only attack surface on the host side. There's no
   daemon outside pi's process; killing pi takes the server down.
 
