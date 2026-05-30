@@ -40,6 +40,8 @@ server starts on `session_start` and prints its URL + a QR code:
 [ ... QR code ... ]
 ```
 
+You can also re-display the QR code anytime with `/remote-qr`.
+
 Update later:
 ```bash
 pi update git:github.com/kolt-mcb/pi-remote-control

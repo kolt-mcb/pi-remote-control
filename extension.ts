@@ -14,6 +14,7 @@
  *
  * Then in pi:
  *   /remote-control   — starts the WS server (or peer mode if port busy)
+ *   /remote-qr        — display the QR code for the phone app (works anytime)
  *   /remote-stop      — stops it
  */
 
@@ -1427,6 +1428,28 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("remote-stop", {
     description: "Stop remote control server",
     handler: async () => stop(pi),
+  });
+
+  pi.registerCommand("remote-qr", {
+    description: "Display QR code to connect the phone app",
+    handler: async () => {
+      const ip = localIP();
+      const url = urlWithToken(`wss://${ip}:${DEFAULT_PORT}`);
+      // Print a visible divider + QR so the code isn't lost behind the
+      // input line.  The URL is printed AFTER the QR code (phone can
+      // tap-and-hold to copy it) as a fallback for scanning.
+      const sep = "━".repeat(50);
+      console.log();
+      console.log(`${sep}`);
+      console.log(`  Scan this QR with your phone\n`);
+      qrcodeTerminal.generate(url, { small: true }, (qr: string) => {
+        console.log(qr);
+        console.log();
+        // Full URL always visible as backup
+        console.log(`  ${url}`);
+        console.log(`${sep}\n`);
+      });
+    },
   });
 
   // ── Message renderer ──────────────────────────────────────────────────
