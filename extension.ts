@@ -597,6 +597,174 @@ function sendCommandList(ws: WebSocket): void {
   ws.send(JSON.stringify({ type: "command_list", commands: buildCommandList() }));
 }
 
+// ── Conversation history replay ─────────────────────────────────────────────
+// On (re)connect the phone only sees events from that point forward — anything
+// said before it joined (including a whole conversation started in the
+// terminal, or one another device drove) is invisible until the next turn.
+// We replay the resolved session here: walk buildSessionContext().messages and
+// ship a flat list of already-shaped bubbles the app can render verbatim. The
+// app treats this as authoritative and replaces its message list, so a reconnect
+// repaints the full thread without duplicating live events.
+const HISTORY_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
+
+// Plain-text portion of a pi message's content (array of typed blocks, or a
+// legacy plain string). Mirrors the app's extractText / message_end handling.
+function historyBlocksText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((b: any) => b?.type === "text")
+      .map((b: any) => (typeof b.text === "string" ? b.text : ""))
+      .join("");
+  }
+  return "";
+}
+
+// Image attachments from a content array, capped like the live forwarding path.
+function historyImages(content: unknown): Array<{ data: string; mimeType: string }> {
+  const out: Array<{ data: string; mimeType: string }> = [];
+  if (!Array.isArray(content)) return out;
+  for (const block of content as any[]) {
+    if (block?.type === "image" && block?.data) {
+      const data = typeof block.data === "string" ? block.data : JSON.stringify(block.data);
+      if (Buffer.byteLength(data, "base64") <= HISTORY_IMAGE_MAX_BYTES) {
+        out.push({ data, mimeType: block.mimeType || "image/png" });
+      }
+    }
+  }
+  return out;
+}
+
+// Turn one pi AgentMessage into zero or more renderable history items, pushed
+// onto [items] in conversation order. [toolIdx] maps a toolCallId to the index
+// of its (already-positioned) tool bubble so a later toolResult fills it in.
+function pushHistoryMessage(
+  m: any,
+  items: Record<string, unknown>[],
+  toolIdx: Map<string, number>,
+  theme: unknown,
+): void {
+  const role = m?.role;
+  if (role === "user") {
+    const text = historyBlocksText(m.content);
+    const images = historyImages(m.content);
+    if (text || images.length) {
+      const item: Record<string, unknown> = { role: "user", content: text };
+      if (images.length) item.images = images;
+      items.push(item);
+    }
+  } else if (role === "assistant") {
+    const blocks = Array.isArray(m.content) ? m.content : [];
+    let textAcc = "";
+    const flushText = () => {
+      if (textAcc.trim()) items.push({ role: "assistant", content: textAcc });
+      textAcc = "";
+    };
+    for (const b of blocks as any[]) {
+      if (b?.type === "text") {
+        textAcc += typeof b.text === "string" ? b.text : "";
+      } else if (b?.type === "thinking") {
+        flushText();
+        const t = typeof b.thinking === "string" ? b.thinking : "";
+        if (t.trim()) items.push({ role: "thinking", content: t });
+      } else if (b?.type === "toolCall") {
+        flushText();
+        const toolName = typeof b.name === "string" ? b.name : "?";
+        let toolArgs = "";
+        try { toolArgs = JSON.stringify(b.arguments ?? {}); } catch { toolArgs = "{}"; }
+        if (typeof b.id === "string") toolIdx.set(b.id, items.length);
+        items.push({
+          role: "tool",
+          toolCallId: typeof b.id === "string" ? b.id : "",
+          toolName,
+          toolArgs,
+          content: "",
+          isError: false,
+        });
+      }
+    }
+    flushText();
+  } else if (role === "toolResult") {
+    const id = typeof m.toolCallId === "string" ? m.toolCallId : "";
+    const text = historyBlocksText(m.content);
+    const images = historyImages(m.content);
+    const ansiLines = renderToolResultLines(m.toolName ?? "", m.content, theme);
+    const idx = id ? toolIdx.get(id) : undefined;
+    const patch: Record<string, unknown> = { content: text, isError: m.isError === true };
+    if (images.length) patch.images = images;
+    if (ansiLines) patch.ansiLines = ansiLines;
+    if (idx !== undefined) {
+      items[idx] = { ...items[idx], ...patch };
+    } else {
+      // Orphan result (its toolCall isn't on this branch): show it standalone.
+      items.push({ role: "tool", toolCallId: id, toolName: m.toolName ?? "?", toolArgs: "", ...patch });
+    }
+  } else if (role === "bashExecution") {
+    if (m.excludeFromContext) return; // !! prefix — hidden from the conversation
+    const cmd = typeof m.command === "string" ? m.command : "";
+    const output = typeof m.output === "string" ? m.output : "";
+    items.push({
+      role: "tool",
+      toolCallId: "",
+      toolName: "bash",
+      toolArgs: cmd ? JSON.stringify({ command: cmd }) : "",
+      content: output,
+      isError: typeof m.exitCode === "number" && m.exitCode !== 0,
+    });
+  } else if (role === "custom") {
+    if (m.display === false) return;
+    const ansiLines = renderCustomMessageLines(m, theme);
+    if (ansiLines) {
+      items.push({ role: "custom", customType: m.customType ?? "", ansiLines });
+    } else {
+      const text = historyBlocksText(m.content);
+      if (text.trim()) items.push({ role: "assistant", content: text });
+    }
+  }
+}
+
+function sendHistory(ws: WebSocket): void {
+  if (ws.readyState !== 1 || mode !== "host" || !selfSm) return;
+  // Walk the current branch root→leaf. getBranch() keeps pre-compaction message
+  // entries (a compaction only inserts a summary marker in the chain), so this
+  // is the full scrollback — unlike buildSessionContext(), which collapses
+  // everything before a compaction into the summary.
+  let entries: any[] = [];
+  try {
+    entries = (selfSm.getBranch?.() as any[]) ?? [];
+  } catch (e: any) {
+    console.warn(`sendHistory: getBranch failed: ${e?.message ?? e}`);
+    return;
+  }
+  const theme = selfUi?.theme;
+  const items: Record<string, unknown>[] = [];
+  // toolCallId → index in items, so a later toolResult fills in its tool bubble.
+  const toolIdx = new Map<string, number>();
+
+  for (const entry of entries) {
+    if (entry?.type === "message" && entry.message) {
+      pushHistoryMessage(entry.message, items, toolIdx, theme);
+    } else if (entry?.type === "custom_message" && entry.display !== false) {
+      // Extension-injected message that participates in context (e.g. notes).
+      pushHistoryMessage(
+        { role: "custom", customType: entry.customType, content: entry.content, display: entry.display },
+        items, toolIdx, theme,
+      );
+    }
+    // model_change / thinking_level_change / compaction / branch_summary /
+    // label / session_info / custom entries carry no chat bubble — skip them.
+  }
+
+  let sessionId: string | undefined;
+  try { sessionId = selfSm.getSessionId?.(); } catch { /* ignore */ }
+  ws.send(JSON.stringify({
+    type: "history",
+    agentId: SELF_AGENT_ID,
+    sessionId,
+    messages: items,
+  }));
+}
+
 /**
  * Catch stale-extension-runtime exceptions that would crash pi.
  * Sends a notify banner and returns false on error.
@@ -797,6 +965,9 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
     sendCommandList(ws);
     // Send the current Pi theme palette so the phone UI mirrors the terminal
     sendCurrentTheme(ws);
+    // Replay the full conversation so a fresh connect (or reconnect) shows the
+    // whole thread, not just events from this point forward.
+    sendHistory(ws);
 
     ws.on("message", (data: RawData) => {
       const text = data.toString();
@@ -1514,6 +1685,10 @@ export default function (pi: ExtensionAPI) {
 
   // ── Message events ────────────────────────────────────────────────────
 
+  // Max bytes for images forwarded to the phone (base64 payload).
+  // Bigger than most phone displays — 10 MB is ~3840×2160 PNG uncompressed.
+  const TOOL_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
+
   pi.on("message_start", async (e) => {
     emitAgentEvent({ type: "message_start", message: e.message });
   });
@@ -1523,9 +1698,26 @@ export default function (pi: ExtensionAPI) {
     // its Component at the phone's width and attach the ANSI lines to the message.
     const theme = ctx?.hasUI ? ctx.ui.theme : undefined;
     const ansiLines = renderCustomMessageLines(e.message, theme);
+    // Extract images from message content (user messages with photo attachments,
+    // assistant responses containing images). The phone's extractText skips image
+    // blocks for text, so forward them as a separate `images` array.
+    const msgImages: any[] = [];
+    const mc = e.message?.content;
+    if (Array.isArray(mc)) {
+      for (const block of mc) {
+        if (block?.type === "image" && block?.data) {
+          const data = typeof block.data === "string" ? block.data : JSON.stringify(block.data);
+          if (Buffer.byteLength(data, "base64") <= TOOL_IMAGE_MAX_BYTES) {
+            msgImages.push({ data, mimeType: block.mimeType || "image/png" });
+          }
+        }
+      }
+    }
+    const msgPayload: any = ansiLines ? { ...e.message, ansiLines } : e.message;
+    if (msgImages.length > 0) msgPayload.images = msgImages;
     emitAgentEvent({
       type: "message_end",
-      message: ansiLines ? { ...e.message, ansiLines } : e.message,
+      message: msgPayload,
     });
   });
 
@@ -1589,8 +1781,33 @@ export default function (pi: ExtensionAPI) {
     const cr = e.result;
     // Extract content: try .text[] first, then .content[] (file read results)
     let content = "";
+    // Extract images from tool results (e.g. `read` on image files returns
+    // base64 data in the content array). These are sent to the phone separately
+    // so the app can render them inline; they're excluded from `content` text
+    // to avoid shipping megabytes of base64 in a text field.
+    const extractImages = (obj: any, maxBytes = TOOL_IMAGE_MAX_BYTES): any[] => {
+      const imgs: any[] = [];
+      if (Array.isArray(obj?.content)) {
+        for (const c of obj.content) {
+          if (c?.type === "image" && c?.data && typeof c.data === "string") {
+            const size = Buffer.byteLength(c.data, "base64");
+            if (size <= maxBytes) {
+              imgs.push({ data: c.data, mimeType: c.mimeType || "image/png" });
+            }
+          }
+        }
+      }
+      if (obj?.imageData && typeof obj.imageData === "string" && obj?.imageMimeType) {
+        const size = Buffer.byteLength(obj.imageData, "base64");
+        if (size <= maxBytes) {
+          imgs.push({ data: obj.imageData, mimeType: obj.imageMimeType });
+        }
+      }
+      return imgs;
+    };
+    const toolImages = extractImages(cr);
     if (Array.isArray(cr?.content)) {
-      content = cr.content.map((c: any) => c.text ?? c.content ?? "").join("\n");
+      content = cr.content.map((c: any) => c.type === "image" ? "" : (c.text ?? c.content ?? "")).join("\n").replace(/\n{3,}/g, "\n\n").trim();
     } else if (typeof cr?.content === "string") {
       content = cr.content;
     }
@@ -1609,6 +1826,7 @@ export default function (pi: ExtensionAPI) {
       content,
       isError: e.isError ?? false,
       ...(ansiLines ? { ansiLines } : {}),
+      ...(toolImages.length > 0 ? { images: toolImages } : {}),
     });
   });
 
