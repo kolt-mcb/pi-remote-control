@@ -329,6 +329,46 @@ selectListEvents.on("dismiss", (e: { id: string }) => {
   hostBcastClients(JSON.stringify({ type: "extension_ui_dismiss", id: e.id }));
 });
 
+// Phone-native /model picker. pi's /model opens ModelSelectorComponent — a
+// custom fuzzy-search Container, NOT a SelectList — so the SelectList bridge
+// never sees it and the phone gets nothing. Enumerate the registry directly
+// and reuse the existing select-dialog protocol instead.
+const pendingModelPicks = new Map<string, Map<string, any>>();
+
+function showModelPicker(pi: ExtensionAPI): void {
+  void safeCtx(pi, "/model", async (ctx: any) => {
+    const models: any[] = ctx.modelRegistry?.getAvailable?.() ?? [];
+    if (models.length === 0) {
+      hostBcastClients(JSON.stringify({
+        type: "extension_ui_request",
+        method: "notify",
+        id: `notify_model_${Date.now()}`,
+        message: "No models with configured auth available.",
+        notifyType: "warning",
+      }));
+      return;
+    }
+    const current = ctx.model;
+    const id = `modelpick_${Date.now()}`;
+    const byLabel = new Map<string, any>();
+    const options: string[] = [];
+    for (const m of models) {
+      const isCurrent = current && m.provider === current.provider && m.id === current.id;
+      const label = `${isCurrent ? "● " : ""}${m.provider}/${m.id}`;
+      byLabel.set(label, m);
+      options.push(label);
+    }
+    pendingModelPicks.set(id, byLabel);
+    hostBcastClients(JSON.stringify({
+      type: "extension_ui_request",
+      method: "select",
+      id,
+      title: "Select model",
+      options,
+    }));
+  });
+}
+
 // Local agent state (this pi's own agent — applies in both host and peer mode)
 let localBusy = false;
 let localMessageCount = 0;
@@ -1296,6 +1336,8 @@ function executeSlashLocally(pi: ExtensionAPI, commandName: string, args: string
     void safeCtx(pi, "/quit", async (ctx) => { void ctx.shutdown(); });
   } else if (commandName === "resume") {
     showResumePicker(pi);
+  } else if (commandName === "model" && !args.trim()) {
+    showModelPicker(pi);
   } else if (REMOTE_STALES.has(commandName)) {
     // /reload only — would tear down + rebind the runtime mid-call; punt to a
     // notice so the user knows to run it from the terminal.
@@ -1531,6 +1573,25 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
           // We sent labels to the phone; translate back to the SelectItem value.
           const value = liveSelectListLabels.get(id)?.get(label) ?? label;
           respondToSelectList(id, value);
+        }
+      } else if (id.startsWith("modelpick_")) {
+        const byLabel = pendingModelPicks.get(id);
+        pendingModelPicks.delete(id);
+        const model = !cancelled ? byLabel?.get(label) : undefined;
+        if (model) {
+          void (async () => {
+            let ok = false;
+            try { ok = await pi.setModel(model); } catch { /* keep ok=false */ }
+            hostBcastClients(JSON.stringify({
+              type: "extension_ui_request",
+              method: "notify",
+              id: `notify_model_${Date.now()}`,
+              message: ok
+                ? `Model set to ${model.provider}/${model.id}`
+                : `Could not set ${model.provider}/${model.id} (no API key?)`,
+              notifyType: ok ? "info" : "warning",
+            }));
+          })();
         }
       }
       break;
