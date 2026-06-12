@@ -50,7 +50,16 @@ if (!respondToSelectList) {
   respondToSelectList = () => {};
 }
 // BUILTIN_SLASH_COMMANDS used to match supported remote commands (/compact, /quit).
-import { BUILTIN_SLASH_COMMANDS, SessionManager } from "@earendil-works/pi-coding-agent";
+// The message/tool components are pi's own interactive-mode renderers — we
+// re-render them headless at the phone's width so the app shows *exactly*
+// what the terminal shows (markdown, syntax highlighting, diffs, theming).
+import {
+  AssistantMessageComponent,
+  BUILTIN_SLASH_COMMANDS,
+  SessionManager,
+  ToolExecutionComponent,
+  UserMessageComponent,
+} from "@earendil-works/pi-coding-agent";
 import type { SessionInfo } from "@earendil-works/pi-coding-agent";
 import qrcodeTerminal from "qrcode-terminal";
 
@@ -690,14 +699,21 @@ function pushHistoryMessage(
     const images = historyImages(m.content);
     if (text || images.length) {
       const item: Record<string, unknown> = { role: "user", content: text };
-      if (images.length) item.images = images;
+      const { stream, overflow } = withImageLines(renderUserStream(text), images);
+      if (stream) item.stream = stream;
+      if (overflow.length) item.images = overflow;
       items.push(item);
     }
   } else if (role === "assistant") {
     const blocks = Array.isArray(m.content) ? m.content : [];
     let textAcc = "";
     const flushText = () => {
-      if (textAcc.trim()) items.push({ role: "assistant", content: textAcc });
+      if (textAcc.trim()) {
+        const item: Record<string, unknown> = { role: "assistant", content: textAcc };
+        const stream = renderAssistantStream(textAcc);
+        if (stream) item.stream = stream;
+        items.push(item);
+      }
       textAcc = "";
     };
     for (const b of blocks as any[]) {
@@ -706,21 +722,33 @@ function pushHistoryMessage(
       } else if (b?.type === "thinking") {
         flushText();
         const t = typeof b.thinking === "string" ? b.thinking : "";
-        if (t.trim()) items.push({ role: "thinking", content: t });
+        if (t.trim()) {
+          const item: Record<string, unknown> = { role: "thinking", content: t };
+          const stream = renderThinkingStream(t);
+          if (stream) item.stream = stream;
+          items.push(item);
+        }
       } else if (b?.type === "toolCall") {
         flushText();
         const toolName = typeof b.name === "string" ? b.name : "?";
         let toolArgs = "";
         try { toolArgs = JSON.stringify(b.arguments ?? {}); } catch { toolArgs = "{}"; }
         if (typeof b.id === "string") toolIdx.set(b.id, items.length);
-        items.push({
+        const item: Record<string, unknown> = {
           role: "tool",
           toolCallId: typeof b.id === "string" ? b.id : "",
           toolName,
           toolArgs,
           content: "",
           isError: false,
-        });
+          // Raw args stashed for the toolResult patch to re-render with the
+          // result attached; stripped by sendHistory before the frame ships.
+          __args: b.arguments ?? {},
+        };
+        const { stream, streamExpanded } = renderToolStreams(toolName, item.toolCallId as string, b.arguments ?? {});
+        if (stream) item.stream = stream;
+        if (streamExpanded) item.streamExpanded = streamExpanded;
+        items.push(item);
       }
     }
     flushText();
@@ -728,11 +756,28 @@ function pushHistoryMessage(
     const id = typeof m.toolCallId === "string" ? m.toolCallId : "";
     const text = historyBlocksText(m.content);
     const images = historyImages(m.content);
-    const ansiLines = renderToolResultLines(m.toolName ?? "", m.content, theme);
     const idx = id ? toolIdx.get(id) : undefined;
+    const prior = idx !== undefined ? items[idx] : undefined;
+    const toolName = (prior?.toolName as string) ?? (m.toolName ?? "?");
+    const resultContent = Array.isArray(m.content)
+      ? m.content
+      : text ? [{ type: "text", text }] : [];
+    let { stream, streamExpanded } = renderToolStreams(
+      toolName, id, (prior as any)?.__args ?? {},
+      { content: resultContent, isError: m.isError === true },
+    );
+    if (!stream) {
+      stream = linesToStream(renderToolResultLines(toolName, m.content, theme));
+      streamExpanded = undefined;
+    }
+    const withImgs = withImageLines(stream, images);
     const patch: Record<string, unknown> = { content: text, isError: m.isError === true };
-    if (images.length) patch.images = images;
-    if (ansiLines) patch.ansiLines = ansiLines;
+    if (withImgs.stream) patch.stream = withImgs.stream;
+    if (streamExpanded) {
+      patch.streamExpanded = withImageLines(streamExpanded, images).stream;
+    }
+    const leftoverImages = withImgs.stream ? withImgs.overflow : images;
+    if (leftoverImages.length) patch.images = leftoverImages;
     if (idx !== undefined) {
       items[idx] = { ...items[idx], ...patch };
     } else {
@@ -743,22 +788,35 @@ function pushHistoryMessage(
     if (m.excludeFromContext) return; // !! prefix — hidden from the conversation
     const cmd = typeof m.command === "string" ? m.command : "";
     const output = typeof m.output === "string" ? m.output : "";
-    items.push({
+    const isError = typeof m.exitCode === "number" && m.exitCode !== 0;
+    const item: Record<string, unknown> = {
       role: "tool",
       toolCallId: "",
       toolName: "bash",
       toolArgs: cmd ? JSON.stringify({ command: cmd }) : "",
       content: output,
-      isError: typeof m.exitCode === "number" && m.exitCode !== 0,
-    });
+      isError,
+    };
+    const { stream, streamExpanded } = renderToolStreams(
+      "bash", "", { command: cmd },
+      { content: output ? [{ type: "text", text: output }] : [], isError },
+    );
+    if (stream) item.stream = stream;
+    if (streamExpanded) item.streamExpanded = streamExpanded;
+    items.push(item);
   } else if (role === "custom") {
     if (m.display === false) return;
-    const ansiLines = renderCustomMessageLines(m, theme);
-    if (ansiLines) {
-      items.push({ role: "custom", customType: m.customType ?? "", ansiLines });
+    const stream = linesToStream(renderCustomMessageLines(m, theme));
+    if (stream) {
+      items.push({ role: "custom", customType: m.customType ?? "", stream });
     } else {
       const text = historyBlocksText(m.content);
-      if (text.trim()) items.push({ role: "assistant", content: text });
+      if (text.trim()) {
+        const item: Record<string, unknown> = { role: "assistant", content: text };
+        const md = renderAssistantStream(text);
+        if (md) item.stream = md;
+        items.push(item);
+      }
     }
   }
 }
@@ -794,6 +852,9 @@ function sendHistory(ws: WebSocket): void {
     // model_change / thinking_level_change / compaction / branch_summary /
     // label / session_info / custom entries carry no chat bubble — skip them.
   }
+
+  // Strip the raw-args stash (only needed while patching tool results above).
+  for (const it of items) delete it.__args;
 
   let sessionId: string | undefined;
   try { sessionId = selfSm.getSessionId?.(); } catch { /* ignore */ }
@@ -894,6 +955,119 @@ function renderToolResultLines(toolName: string, result: any, theme: any): strin
     const renderContext = { state: {}, requestRedraw: () => {}, expanded: true };
     return componentToLines(renderResult(result, { expanded: true }, theme, renderContext));
   } catch { return undefined; }
+}
+
+// ── Phone-native message rendering (host-side ANSI, PROTOCOL.md) ────────────
+// The app is a dumb TTY: every message ships as a single pre-rendered ANSI+OSC
+// `stream` string (lines joined with \n) that the phone feeds through its
+// terminal parser verbatim. We reuse pi's OWN interactive components so the
+// phone shows exactly what the terminal shows. Tool results also carry
+// `streamExpanded` so the phone's tap-to-expand keeps working.
+//
+// Everything degrades gracefully: any renderer failure returns undefined and
+// the app falls back to client-side plain-text rendering of the structured
+// fields (which still ride along unchanged).
+
+// Components only use the TUI handle to request repaints; for one-shot
+// snapshot renders a no-op is fine.
+const headlessUi: any = { requestRender: () => {} };
+
+function linesToStream(lines: string[] | undefined): string | undefined {
+  return lines && lines.length > 0 ? lines.join("\n") : undefined;
+}
+
+function renderUserStream(text: string): string | undefined {
+  if (!text.trim()) return undefined;
+  try {
+    return linesToStream(new UserMessageComponent(text).render(clientCols));
+  } catch { return undefined; }
+}
+
+function renderAssistantStream(markdown: string): string | undefined {
+  if (!markdown.trim()) return undefined;
+  try {
+    const msg: any = { role: "assistant", content: [{ type: "text", text: markdown }], stopReason: "stop" };
+    return linesToStream(new AssistantMessageComponent(msg).render(clientCols));
+  } catch { return undefined; }
+}
+
+function renderThinkingStream(thinking: string): string | undefined {
+  if (!thinking.trim()) return undefined;
+  try {
+    const msg: any = { role: "assistant", content: [{ type: "thinking", thinking }], stopReason: "stop" };
+    return linesToStream(new AssistantMessageComponent(msg).render(clientCols));
+  } catch { return undefined; }
+}
+
+// Full tool display — header, args, edit diffs, result — exactly as pi's
+// terminal renders it, in collapsed and expanded variants.
+function renderToolStreams(
+  toolName: string,
+  toolCallId: string,
+  args: any,
+  result?: { content: any[]; isError: boolean; details?: any },
+): { stream?: string; streamExpanded?: string } {
+  try {
+    let def: any;
+    const getDef = (piApi as any)?.getToolDefinition;
+    if (typeof getDef === "function") def = getDef.call(piApi, toolName);
+    let cwd = process.cwd();
+    try { cwd = selfSm?.getCwd?.() ?? cwd; } catch { /* keep process.cwd */ }
+    const comp = new ToolExecutionComponent(
+      toolName,
+      toolCallId,
+      args ?? {},
+      { showImages: false }, // images ship as OSC 1337 lines instead (below)
+      typeof def === "object" && def !== null ? def : undefined,
+      headlessUi,
+      cwd,
+    );
+    comp.markExecutionStarted();
+    comp.setArgsComplete();
+    if (result) {
+      comp.updateResult({
+        content: Array.isArray(result.content) ? result.content : [],
+        isError: result.isError === true,
+        details: result.details,
+      });
+    }
+    const stream = linesToStream(comp.render(clientCols));
+    comp.setExpanded(true);
+    const expanded = linesToStream(comp.render(clientCols));
+    return { stream, streamExpanded: expanded !== stream ? expanded : undefined };
+  } catch {
+    return {};
+  }
+}
+
+// Inline images ride inside the stream as OSC 1337 sequences (the app's
+// primary image channel). The app's parser drops base64 payloads over 8 MiB,
+// so anything bigger falls back to the structured images[] array — the app
+// appends those after the stream.
+const OSC_IMAGE_MAX_B64 = 8 * 1024 * 1024;
+
+function osc1337ImageLine(img: { data: string; mimeType: string }): string | undefined {
+  if (!img.data || img.data.length > OSC_IMAGE_MAX_B64) return undefined;
+  const size = Buffer.byteLength(img.data, "base64");
+  return `\x1b]1337;File=inline=1;size=${size};mime=${img.mimeType || "image/png"};width=auto:${img.data}\x1b\\`;
+}
+
+// Append embeddable images to [stream] as OSC lines; return the leftovers
+// that must still travel as a structured images[] array.
+function withImageLines(
+  stream: string | undefined,
+  images: Array<{ data: string; mimeType: string }>,
+): { stream?: string; overflow: Array<{ data: string; mimeType: string }> } {
+  const lines: string[] = [];
+  const overflow: Array<{ data: string; mimeType: string }> = [];
+  for (const img of images) {
+    const line = osc1337ImageLine(img);
+    if (line) lines.push(line);
+    else overflow.push(img);
+  }
+  if (lines.length === 0) return { stream, overflow };
+  const joined = lines.join("\n");
+  return { stream: stream ? `${stream}\n${joined}` : joined, overflow };
 }
 
 function parseNameFromUrl(reqUrl: string | undefined, fallback: string): string {
@@ -1360,10 +1534,23 @@ function executeSlashLocally(pi: ExtensionAPI, commandName: string, args: string
 function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSocket): void {
   switch (cmd.type as string) {
     case "viewport": {
-      // App reports its width in monospace columns so we re-render extension
+      // App reports its width in monospace columns so we re-render pi's
       // components to fit the device. Clamp to a sane range.
       const cols = Number(cmd.cols);
-      if (Number.isFinite(cols)) clientCols = Math.max(20, Math.min(400, Math.floor(cols)));
+      if (!Number.isFinite(cols)) break;
+      const next = Math.max(20, Math.min(400, Math.floor(cols)));
+      if (next === clientCols) break;
+      clientCols = next;
+      // Streams are rendered at the width current when each message was sent;
+      // a width change re-renders the whole scrollback via a history replay.
+      sendHistory(ws);
+      // Peers render their own streams but never see viewport messages —
+      // forward the width so their output fits the device too.
+      for (const peerWs of peerConns.values()) {
+        if (peerWs.readyState === 1) {
+          peerWs.send(JSON.stringify({ type: "route_viewport", cols: next }));
+        }
+      }
       break;
     }
     case "peer_hello": {
@@ -1634,6 +1821,12 @@ function handlePeerInbound(msg: Record<string, unknown>, pi: ExtensionAPI): void
       if (commandName) executeSlashLocally(pi, commandName, (msg.args as string) ?? "");
       break;
     }
+    case "route_viewport": {
+      // Host forwarded the phone's viewport width so our rendered streams fit.
+      const cols = Number(msg.cols);
+      if (Number.isFinite(cols)) clientCols = Math.max(20, Math.min(400, Math.floor(cols)));
+      break;
+    }
     // peer_ack and any other host->peer messages: ignored (no state to update)
   }
 }
@@ -1750,60 +1943,117 @@ export default function (pi: ExtensionAPI) {
   // Bigger than most phone displays — 10 MB is ~3840×2160 PNG uncompressed.
   const TOOL_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
 
+  // Attach the phone-rendered presentation of a user message: pi's own
+  // UserMessageComponent plus inline OSC 1337 images. Oversize images stay in
+  // a structured images[] array the app appends after the stream.
+  const decorateUserMessage = (message: any): any => {
+    const text = historyBlocksText(message?.content);
+    const { stream, overflow } = withImageLines(
+      renderUserStream(text),
+      historyImages(message?.content),
+    );
+    if (!stream && overflow.length === 0) return message;
+    const payload: any = { ...message };
+    if (stream) payload.stream = stream;
+    if (overflow.length > 0) payload.images = overflow;
+    return payload;
+  };
+
   pi.on("message_start", async (e) => {
-    emitAgentEvent({ type: "message_start", message: e.message });
+    const payload = e.message?.role === "user" ? decorateUserMessage(e.message) : e.message;
+    emitAgentEvent({ type: "message_start", message: payload });
   });
 
   pi.on("message_end", async (e, ctx) => {
-    // For custom-message entries, mirror the extension's own rendering: re-render
-    // its Component at the phone's width and attach the ANSI lines to the message.
-    const theme = ctx?.hasUI ? ctx.ui.theme : undefined;
-    const ansiLines = renderCustomMessageLines(e.message, theme);
-    // Extract images from message content (user messages with photo attachments,
-    // assistant responses containing images). The phone's extractText skips image
-    // blocks for text, so forward them as a separate `images` array.
-    const msgImages: any[] = [];
-    const mc = e.message?.content;
-    if (Array.isArray(mc)) {
-      for (const block of mc) {
-        if (block?.type === "image" && block?.data) {
-          const data = typeof block.data === "string" ? block.data : JSON.stringify(block.data);
-          if (Buffer.byteLength(data, "base64") <= TOOL_IMAGE_MAX_BYTES) {
-            msgImages.push({ data, mimeType: block.mimeType || "image/png" });
+    let msgPayload: any = e.message;
+    if (e.message?.role === "user") {
+      msgPayload = decorateUserMessage(e.message);
+    } else {
+      // Custom-message entries: mirror the extension's own rendering by
+      // re-rendering its Component at the phone's width.
+      const theme = ctx?.hasUI ? ctx.ui.theme : undefined;
+      const customStream = linesToStream(renderCustomMessageLines(e.message, theme));
+      // Extract images from message content (e.g. assistant responses containing
+      // images): embeddable ones ride the stream as OSC 1337, the rest go in images[].
+      const msgImages: any[] = [];
+      const mc = (e.message as any)?.content;
+      if (Array.isArray(mc)) {
+        for (const block of mc) {
+          if (block?.type === "image" && block?.data) {
+            const data = typeof block.data === "string" ? block.data : JSON.stringify(block.data);
+            if (Buffer.byteLength(data, "base64") <= TOOL_IMAGE_MAX_BYTES) {
+              msgImages.push({ data, mimeType: block.mimeType || "image/png" });
+            }
           }
         }
       }
+      const { stream, overflow } = withImageLines(customStream, msgImages);
+      if (stream || overflow.length > 0) {
+        msgPayload = { ...e.message };
+        if (stream) msgPayload.stream = stream;
+        if (overflow.length > 0) msgPayload.images = overflow;
+      }
     }
-    const msgPayload: any = ansiLines ? { ...e.message, ansiLines } : e.message;
-    if (msgImages.length > 0) msgPayload.images = msgImages;
     emitAgentEvent({
       type: "message_end",
       message: msgPayload,
     });
   });
 
+  // Accumulate streaming deltas so text_end / thinking_end can ship the final
+  // host-rendered stream, and throttled ansi_snapshot events give the phone
+  // styled markdown WHILE the text streams (it re-renders the in-flight
+  // bubble from each snapshot). pi can interleave thinking and text streams,
+  // so each gets its own accumulator.
+  let liveText = "";
+  let liveThinking = "";
+  let lastSnapshotAt = 0;
+  const SNAPSHOT_THROTTLE_MS = 150;
+
+  const maybeSnapshot = (render: () => string | undefined): void => {
+    const now = Date.now();
+    if (now - lastSnapshotAt < SNAPSHOT_THROTTLE_MS) return;
+    lastSnapshotAt = now;
+    const stream = render();
+    if (stream) {
+      emitAgentEvent({ type: "message_update", eventType: "ansi_snapshot", stream });
+    }
+  };
+
   pi.on("message_update", async (e: any) => {
     const evt = e.assistantMessageEvent;
     if (!evt) return;
     switch (evt.type) {
       case "text_start":
+        liveText = "";
         emitAgentEvent({ type: "message_update", eventType: "text_start" });
         break;
       case "text_delta":
+        liveText += evt.delta ?? "";
         emitAgentEvent({ type: "message_update", eventType: "text_delta", delta: evt.delta ?? "" });
+        maybeSnapshot(() => renderAssistantStream(liveText));
         break;
-      case "text_end":
-        emitAgentEvent({ type: "message_update", eventType: "text_end" });
+      case "text_end": {
+        const stream = renderAssistantStream(liveText);
+        liveText = "";
+        emitAgentEvent({ type: "message_update", eventType: "text_end", ...(stream ? { stream } : {}) });
         break;
+      }
       case "thinking_start":
+        liveThinking = "";
         emitAgentEvent({ type: "message_update", eventType: "thinking_start" });
         break;
       case "thinking_delta":
+        liveThinking += evt.delta ?? "";
         emitAgentEvent({ type: "message_update", eventType: "thinking_delta", delta: evt.delta ?? "" });
+        maybeSnapshot(() => renderThinkingStream(liveThinking));
         break;
-      case "thinking_end":
-        emitAgentEvent({ type: "message_update", eventType: "thinking_end" });
+      case "thinking_end": {
+        const stream = renderThinkingStream(liveThinking);
+        liveThinking = "";
+        emitAgentEvent({ type: "message_update", eventType: "thinking_end", ...(stream ? { stream } : {}) });
         break;
+      }
       case "done":
         emitAgentEvent({ type: "message_update", eventType: "done", reason: (evt as any).reason ?? "" });
         break;
@@ -1815,7 +2065,12 @@ export default function (pi: ExtensionAPI) {
 
   // ── Tool events ───────────────────────────────────────────────────────
 
+  // toolCallId → args, kept from tool_start so tool_end can render the full
+  // tool display (header + args + diff + result) without re-parsing anything.
+  const liveToolArgs = new Map<string, any>();
+
   pi.on("tool_execution_start", async (e) => {
+    liveToolArgs.set(e.toolCallId, e.args ?? {});
     emitAgentEvent({
       type: "tool_start",
       toolCallId: e.toolCallId,
@@ -1876,18 +2131,37 @@ export default function (pi: ExtensionAPI) {
     if (!content && typeof cr === "object") {
       content = (cr.text as string) ?? (cr.output as string) ?? "";
     }
-    // Mirror the tool's own result renderer (e.g. pi-subagents' per-step cards)
-    // by re-rendering it at the phone's width; falls back to `content` text.
-    const theme = ctx?.hasUI ? ctx.ui.theme : undefined;
-    const ansiLines = renderToolResultLines(e.toolName ?? "", cr, theme);
+    // Render the complete tool display (header, args, diffs, result) with pi's
+    // own ToolExecutionComponent — collapsed + expanded variants. Falls back to
+    // the bare result renderer, then to plain `content` text on old pi builds.
+    const args = liveToolArgs.get(e.toolCallId);
+    liveToolArgs.delete(e.toolCallId);
+    const resultContent = Array.isArray(cr?.content)
+      ? cr.content
+      : content ? [{ type: "text", text: content }] : [];
+    let { stream, streamExpanded } = renderToolStreams(
+      e.toolName ?? "", e.toolCallId, args,
+      { content: resultContent, isError: e.isError === true, details: cr?.details },
+    );
+    if (!stream) {
+      const theme = ctx?.hasUI ? ctx.ui.theme : undefined;
+      stream = linesToStream(renderToolResultLines(e.toolName ?? "", cr, theme));
+      streamExpanded = undefined;
+    }
+    // Embeddable images ride the stream as OSC 1337; oversize ones stay in images[].
+    const withImgs = withImageLines(stream, toolImages);
+    const expandedWithImgs = streamExpanded ? withImageLines(streamExpanded, toolImages).stream : undefined;
     emitAgentEvent({
       type: "tool_end",
       toolCallId: e.toolCallId,
       toolName: e.toolName ?? "",
       content,
       isError: e.isError ?? false,
-      ...(ansiLines ? { ansiLines } : {}),
-      ...(toolImages.length > 0 ? { images: toolImages } : {}),
+      ...(withImgs.stream ? { stream: withImgs.stream } : {}),
+      ...(expandedWithImgs ? { streamExpanded: expandedWithImgs } : {}),
+      ...((withImgs.stream ? withImgs.overflow : toolImages).length > 0
+        ? { images: withImgs.stream ? withImgs.overflow : toolImages }
+        : {}),
     });
   });
 
