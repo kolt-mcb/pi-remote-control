@@ -502,6 +502,10 @@ const MIRROR_MAX_DEFER_MS = 500;
 // buffer) and full peer frames; tiny diffs stay as uncompressed text (not worth
 // the CPU/overhead). Only sent compressed to clients that advertise `deflate`.
 const MIRROR_DEFLATE_MIN = 512;
+// Adaptive cadence: a client's minimum inter-frame interval grows by one base
+// frame-period per this much queued data, so a client whose link can't keep up
+// degrades smoothly (lower fps) instead of bursting then hard-dropping at the cap.
+const MIRROR_SOFT_STEP = 32 * 1024;
 // Set PI_REMOTE_DEBUG=1 to log mirror throughput (KiB/s, fps, dropped frames).
 const MIRROR_DEBUG = process.env.PI_REMOTE_DEBUG === "1";
 let mirrorTui: any = null;          // live TUI instance, captured via widget probe
@@ -549,8 +553,22 @@ function pendingHistory(): Map<WebSocket, NodeJS.Timeout> {
 // Last mirror frame actually SENT to each client, for row-level diffing. Stored
 // per-client (not globally) because the backpressure gate drops frames for slow
 // clients independently, so each client's diff base is whatever it last received.
-function mirrorClientState(): Map<WebSocket, { lines: string[]; width: number; height: number }> {
-  return ((RC as any).mirrorClientState ??= new Map<WebSocket, { lines: string[]; width: number; height: number }>());
+function mirrorClientState(): Map<WebSocket, { lines: string[]; width: number; height: number; lastSentAt: number }> {
+  return ((RC as any).mirrorClientState ??= new Map<WebSocket, { lines: string[]; width: number; height: number; lastSentAt: number }>());
+}
+// Per-client minimum interval (ms) before the next frame, scaled by how much data
+// is already queued on its socket. Zero backlog → base rate; grows from there.
+function clientSendInterval(bufferedAmount: number): number {
+  return MIRROR_FRAME_MS * (1 + Math.floor(bufferedAmount / MIRROR_SOFT_STEP));
+}
+// True if at least one self-mirroring client could receive a frame right now
+// (open and under the hard backpressure cap). Lets the pump skip the expensive
+// O(session) render when every viewer is congested.
+function anyClientCanReceiveMirror(): boolean {
+  for (const [ws, target] of mirrorTargets()) {
+    if (target === SELF_AGENT_ID && ws.readyState === 1 && ((ws as any).bufferedAmount ?? 0) <= MIRROR_MAX_BUFFERED) return true;
+  }
+  return false;
 }
 // Changed rows between two frames: [{ i, t }] for every index whose text differs
 // (including new trailing rows). Removed trailing rows are conveyed by lineCount.
@@ -610,6 +628,9 @@ function ensureMirrorPump(): void {
       const desktopActive = now - lastDesktopRenderAt < MIRROR_DESKTOP_QUIET_MS;
       const staleFor = now - lastMirrorSentAt;
       if (desktopActive && staleFor < MIRROR_MAX_DEFER_MS) return;
+      // No point doing the O(session) phone-width render if every viewer is
+      // congested and would just drop it — leave mirrorDirty set and wait.
+      if (!anyClientCanReceiveMirror()) return;
     }
     mirrorDirty = false;
     if (renderMirrorNow()) { sendMirrorFrame(); lastMirrorSentAt = now; }
@@ -705,7 +726,7 @@ function sendFrameToClient(ws: WebSocket): void {
   sendMirrorPayload(ws, payload);
   // Copy the lines: the stored base must not alias an array the renderer might
   // reuse/mutate next frame, or diffs would come out empty.
-  mirrorClientState().set(ws, { lines: f.lines.slice(), width: f.width, height: f.height });
+  mirrorClientState().set(ws, { lines: f.lines.slice(), width: f.width, height: f.height, lastSentAt: Date.now() });
 }
 
 /** Send OUR screen: to clients mirroring us (host mode) or upstream (peer mode). */
@@ -721,14 +742,20 @@ function sendMirrorFrame(only?: WebSocket): void {
     // On-subscribe snapshot: always a full keyframe so a new viewer isn't blank.
     if (only.readyState === 1) {
       sendMirrorPayload(only, fullFramePayload());
-      mirrorClientState().set(only, { lines: lastMirrorFrame.lines.slice(), width: lastMirrorFrame.width, height: lastMirrorFrame.height });
+      mirrorClientState().set(only, { lines: lastMirrorFrame.lines.slice(), width: lastMirrorFrame.width, height: lastMirrorFrame.height, lastSentAt: Date.now() });
     }
     return;
   }
+  const now = Date.now();
   for (const [ws, target] of mirrorTargets()) {
     if (target !== SELF_AGENT_ID || ws.readyState !== 1) continue;
+    const buffered = (ws as any).bufferedAmount ?? 0;
     // Backpressure: skip this client's frame if its send buffer is backed up.
-    if (((ws as any).bufferedAmount ?? 0) > MIRROR_MAX_BUFFERED) { mirrorDbgDropped++; continue; }
+    if (buffered > MIRROR_MAX_BUFFERED) { mirrorDbgDropped++; continue; }
+    // Adaptive cadence: hold off if we sent this client a frame more recently
+    // than its (backlog-scaled) interval allows — smooth degradation on slow links.
+    const st = mirrorClientState().get(ws);
+    if (st && now - st.lastSentAt < clientSendInterval(buffered)) continue;
     sendFrameToClient(ws);
   }
 }
