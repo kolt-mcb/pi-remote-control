@@ -529,6 +529,8 @@ function mirrorDebugAccount(bytes: number): void {
 }
 // Peer mode: the host asked us to stream our screen upstream (route_mirror).
 let peerMirrorOn = false;
+// Peer mode: a viewer downstream wants real images, so render kitty graphics.
+let peerWantsImages = false;
 
 // Per-client mirror target (ws -> agentId). Lives on the persistent transport
 // object so a session reload (/new, /resume) keeps phones mirroring seamlessly.
@@ -541,8 +543,8 @@ function mirrorTargets(): Map<WebSocket, string> {
 // message-list scrollback, so we skip the (large, twice-sent) history replay for
 // them — it was the bulk of connect latency. Old clients send no hello and keep
 // getting history via the fallback timer below.
-function clientCaps(): Map<WebSocket, { mirrorOnly: boolean; diff: boolean; deflate: boolean }> {
-  return ((RC as any).clientCaps ??= new Map<WebSocket, { mirrorOnly: boolean; diff: boolean; deflate: boolean }>());
+function clientCaps(): Map<WebSocket, { mirrorOnly: boolean; diff: boolean; deflate: boolean; mirrorImages: boolean }> {
+  return ((RC as any).clientCaps ??= new Map<WebSocket, { mirrorOnly: boolean; diff: boolean; deflate: boolean; mirrorImages: boolean }>());
 }
 // Pending history-replay timers, so a `client_hello` can cancel the deferred
 // send before it fires (and so we can clear it on disconnect).
@@ -591,8 +593,31 @@ function renderMirrorNow(): boolean {
     const termCols = tui.terminal?.columns ?? 80;
     const height = tui.terminal?.rows ?? 24;
     const width = clientCols > 0 ? clientCols : termCols;
-    let lines = tui.render(width);
-    if (tui.overlayStack?.length > 0) lines = tui.compositeOverlays(lines, width, height);
+    // The host terminal is usually image-incapable (xterm), so pi-tui renders
+    // images as text placeholders. The phone CAN show images, so force kitty
+    // graphics output for THIS render only when a viewer asked for images. Safe
+    // because the phone width differs from the host terminal width, so pi-tui's
+    // per-width Image cache keeps the host's own (text) render separate — and we
+    // restore caps before any host render runs. The guard avoids the rare
+    // width-collision case that could leak escapes to the host terminal.
+    const forceImages = mirrorWantsImages() && width !== termCols;
+    let saved: any;
+    if (forceImages) {
+      try {
+        const pitui = require("@earendil-works/pi-tui");
+        saved = pitui.getCapabilities();
+        pitui.setCapabilities({ ...saved, images: "kitty" });
+      } catch { saved = undefined; }
+    }
+    let lines: string[];
+    try {
+      lines = tui.render(width);
+      if (tui.overlayStack?.length > 0) lines = tui.compositeOverlays(lines, width, height);
+    } finally {
+      if (saved !== undefined) {
+        try { require("@earendil-works/pi-tui").setCapabilities(saved); } catch { /* ignore */ }
+      }
+    }
     const cursor = tui.extractCursorPosition(lines, height);
     lines = tui.applyLineResets(lines);
     mirrorSeq++;
@@ -764,6 +789,16 @@ function selfHasMirrorAudience(): boolean {
   if (mode === "peer") return peerMirrorOn;
   for (const target of mirrorTargets().values()) {
     if (target === SELF_AGENT_ID) return true;
+  }
+  return false;
+}
+
+/** Does any current viewer of our screen want real (kitty) images, not text
+ *  placeholders? Drives the forced image render in renderMirrorNow. */
+function mirrorWantsImages(): boolean {
+  if (mode === "peer") return peerWantsImages;
+  for (const [ws, target] of mirrorTargets()) {
+    if (target === SELF_AGENT_ID && clientCaps().get(ws)?.mirrorImages) return true;
   }
   return false;
 }
@@ -1893,7 +1928,7 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
       // Capability handshake. Cancel the deferred history replay; only send it
       // now if this client actually renders history (mirror-only clients don't).
       const mirrorOnly = cmd.mirrorOnly === true;
-      clientCaps().set(ws, { mirrorOnly, diff: cmd.diff === true, deflate: cmd.deflate === true });
+      clientCaps().set(ws, { mirrorOnly, diff: cmd.diff === true, deflate: cmd.deflate === true, mirrorImages: cmd.mirrorImages === true });
       const t = pendingHistory().get(ws);
       if (t) { clearTimeout(t); pendingHistory().delete(ws); }
       if (!mirrorOnly) sendHistory(ws);
@@ -1912,8 +1947,10 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
           sendMirrorFrame(ws);  // immediate snapshot so the view isn't blank
         } else {
           const peerWs = peerConns.get(agentId);
-          // Send the phone's width with the subscribe so the peer clamps too.
-          if (peerWs?.readyState === 1) peerWs.send(JSON.stringify({ type: "route_mirror", on: true, cols: clientCols }));
+          // Send the phone's width with the subscribe so the peer clamps too, plus
+          // whether this viewer can render real images (so the peer emits kitty).
+          const wantsImages = clientCaps().get(ws)?.mirrorImages === true;
+          if (peerWs?.readyState === 1) peerWs.send(JSON.stringify({ type: "route_mirror", on: true, cols: clientCols, images: wantsImages }));
         }
       } else {
         mirrorTargets().delete(ws);
@@ -2246,6 +2283,7 @@ function handlePeerInbound(msg: Record<string, unknown>, pi: ExtensionAPI): void
     case "route_mirror": {
       // A phone is (or stopped) mirroring OUR screen via the host.
       peerMirrorOn = msg.on === true;
+      peerWantsImages = peerMirrorOn && msg.images === true;
       const cols = Number(msg.cols);
       if (peerMirrorOn && Number.isFinite(cols)) clientCols = Math.max(20, Math.min(400, Math.floor(cols)));
       requestMirrorFrame(); // render at the phone width (or revert)
