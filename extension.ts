@@ -317,12 +317,15 @@ let peerReconnectTimer: NodeJS.Timeout | null = null;
     }
     if (!data) throw new Error("sendFile: provide data (base64) or path");
     if (Buffer.byteLength(data, "base64") > 20 * 1024 * 1024) throw new Error("sendFile: file exceeds 20MB cap");
-    hostBcastClients(JSON.stringify({
+    // Route via emitAgentEvent so a PEER agent's file is wrapped as a peer_event
+    // and re-broadcast to phones by the host (a peer has no direct clients of its
+    // own). In host mode this just broadcasts to clients, stamped with our id.
+    emitAgentEvent({
       type: "file",
       name: name || "download.bin",
       mimeType: file.mimeType ?? "application/octet-stream",
       data,
-    }));
+    });
   },
   /**
    * Register a callback for remote TUI input (e.g., D-pad taps from Android).
@@ -531,6 +534,10 @@ function mirrorDebugAccount(bytes: number): void {
 let peerMirrorOn = false;
 // Peer mode: a viewer downstream wants real images, so render kitty graphics.
 let peerWantsImages = false;
+// Peer mode: how many phones are connected to our host (peers have no direct
+// clients of their own). The host pushes this so send_file_to_phone can gate
+// correctly instead of seeing its own always-zero clientConns.
+let hostClientCount = 0;
 
 // Per-client mirror target (ws -> agentId). Lives on the persistent transport
 // object so a session reload (/new, /resume) keeps phones mirroring seamlessly.
@@ -865,6 +872,15 @@ function buildSessionList(): AgentSession[] {
 function hostBcastClients(text: string): void {
   for (const c of clientConns) {
     if (c.readyState === 1) c.send(text);
+  }
+}
+
+// Tell peers how many phones are connected to us, so their send_file_to_phone can
+// gate correctly (peers have no direct clients of their own to count).
+function notifyPeersClientCount(): void {
+  const text = JSON.stringify({ type: "host_clients", clients: clientConns.size });
+  for (const peerWs of peerConns.values()) {
+    if (peerWs.readyState === 1) peerWs.send(text);
   }
 }
 
@@ -1546,6 +1562,7 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
     }
     // Default new connection to client; promoted to peer on peer_hello.
     clientConns.add(ws);
+    notifyPeersClientCount();
     const inferredName = parseNameFromUrl(req.url, "viewer");
     console.log(`  [+] client connected (${clientConns.size} viewers, ${peerConns.size} peers) ${inferredName}`);
 
@@ -1588,6 +1605,7 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
         console.log(`  [-] peer ${peerId} disconnected`);
       } else {
         clientConns.delete(ws);
+        notifyPeersClientCount();
         const target = mirrorTargets().get(ws);
         mirrorTargets().delete(ws);
         clientCaps().delete(ws);
@@ -2002,6 +2020,7 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
       const peerPid = typeof cmd.pid === "number" ? cmd.pid : undefined;
       // Promote this ws from client to peer.
       clientConns.delete(ws);
+      notifyPeersClientCount();
       peerConns.set(peerId, ws);
       wsToPeerId.set(ws, peerId);
       if (peerPid) peerPids.set(peerId, peerPid);
@@ -2018,7 +2037,7 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
         pid: peerPid ?? undefined,
       });
       console.log(`  [*] peer joined: ${peerId} (${name})`);
-      ws.send(JSON.stringify({ type: "peer_ack", hostAgentId: SELF_AGENT_ID }));
+      ws.send(JSON.stringify({ type: "peer_ack", hostAgentId: SELF_AGENT_ID, clients: clientConns.size }));
       hostBcastSessionList();
       break;
     }
@@ -2297,7 +2316,13 @@ function handlePeerInbound(msg: Record<string, unknown>, pi: ExtensionAPI): void
       }
       break;
     }
-    // peer_ack and any other host->peer messages: ignored (no state to update)
+    case "peer_ack":
+    case "host_clients": {
+      // Host tells us how many phones are connected (so file delivery can gate).
+      if (typeof msg.clients === "number") hostClientCount = msg.clients;
+      break;
+    }
+    // any other host->peer messages: ignored (no state to update)
   }
 }
 
@@ -2334,7 +2359,9 @@ export default function (pi: ExtensionAPI) {
       additionalProperties: false,
     } as never,
     async execute(_id: string, params: { path: string; name?: string; mime_type?: string }) {
-      if (clientConns.size === 0) {
+      // A peer has no direct clients; count the phones connected to our host instead.
+      const phones = mode === "host" ? clientConns.size : hostClientCount;
+      if (phones === 0) {
         return {
           content: [{ type: "text", text: "No phone is connected — the file was not sent. The user can connect via the pi-remote-control app (/remote-qr shows the pairing code)." }],
           isError: true,
@@ -2342,7 +2369,7 @@ export default function (pi: ExtensionAPI) {
       }
       (globalThis as any).__piRemote.sendFile({ path: params.path, name: params.name, mimeType: params.mime_type });
       return {
-        content: [{ type: "text", text: `Sent ${params.path} to ${clientConns.size} connected device${clientConns.size === 1 ? "" : "s"} (save/share dialog on the phone).` }],
+        content: [{ type: "text", text: `Sent ${params.path} to ${phones} connected device${phones === 1 ? "" : "s"} (save/share dialog on the phone).` }],
       };
     },
   } as never);
