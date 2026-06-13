@@ -28,6 +28,7 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypt
 import { spawn as spawnChild } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import zlib from "node:zlib";
 import selfsigned from "selfsigned";
 // Local fork of pi-tui exposes selectListEvents/respondToSelectList so we can
 // surface any SelectList-based selector (built-in or extension) to the phone.
@@ -496,6 +497,11 @@ const MIRROR_MAX_BUFFERED = 256 * 1024;
 // but active scrolling is.
 const MIRROR_DESKTOP_QUIET_MS = 50;
 const MIRROR_MAX_DEFER_MS = 500;
+// Deflate mirror payloads (sent as binary WS frames) once they exceed this many
+// bytes — ANSI text compresses ~5-10x. The big win is the initial keyframe (full
+// buffer) and full peer frames; tiny diffs stay as uncompressed text (not worth
+// the CPU/overhead). Only sent compressed to clients that advertise `deflate`.
+const MIRROR_DEFLATE_MIN = 512;
 // Set PI_REMOTE_DEBUG=1 to log mirror throughput (KiB/s, fps, dropped frames).
 const MIRROR_DEBUG = process.env.PI_REMOTE_DEBUG === "1";
 let mirrorTui: any = null;          // live TUI instance, captured via widget probe
@@ -531,8 +537,8 @@ function mirrorTargets(): Map<WebSocket, string> {
 // message-list scrollback, so we skip the (large, twice-sent) history replay for
 // them — it was the bulk of connect latency. Old clients send no hello and keep
 // getting history via the fallback timer below.
-function clientCaps(): Map<WebSocket, { mirrorOnly: boolean; diff: boolean }> {
-  return ((RC as any).clientCaps ??= new Map<WebSocket, { mirrorOnly: boolean; diff: boolean }>());
+function clientCaps(): Map<WebSocket, { mirrorOnly: boolean; diff: boolean; deflate: boolean }> {
+  return ((RC as any).clientCaps ??= new Map<WebSocket, { mirrorOnly: boolean; diff: boolean; deflate: boolean }>());
 }
 // Pending history-replay timers, so a `client_hello` can cancel the deferred
 // send before it fires (and so we can clear it on disconnect).
@@ -664,6 +670,21 @@ function fullFramePayload(): string {
  *  we hold a same-geometry base for it) or a full keyframe, then record what it
  *  received so the next diff is computed against exactly that. A frame skipped by
  *  backpressure must NOT call this, so its base stays at the last frame it got. */
+/** Send a mirror JSON payload to one client: deflate (binary frame) if the client
+ *  supports it and the payload is big enough, else send as text. Accounts the
+ *  actual bytes put on the wire. The app treats ANY binary frame as deflated JSON. */
+function sendMirrorPayload(ws: WebSocket, json: string): void {
+  const caps = clientCaps().get(ws);
+  if (caps?.deflate && json.length >= MIRROR_DEFLATE_MIN) {
+    const buf = zlib.deflateSync(json);
+    ws.send(buf);
+    mirrorDebugAccount(buf.length);
+  } else {
+    ws.send(json);
+    mirrorDebugAccount(Buffer.byteLength(json));
+  }
+}
+
 function sendFrameToClient(ws: WebSocket): void {
   const f = lastMirrorFrame;
   const caps = clientCaps().get(ws);
@@ -681,11 +702,10 @@ function sendFrameToClient(ws: WebSocket): void {
         height: f.height,
       })
     : fullFramePayload();
-  ws.send(payload);
+  sendMirrorPayload(ws, payload);
   // Copy the lines: the stored base must not alias an array the renderer might
   // reuse/mutate next frame, or diffs would come out empty.
   mirrorClientState().set(ws, { lines: f.lines.slice(), width: f.width, height: f.height });
-  mirrorDebugAccount(payload.length);
 }
 
 /** Send OUR screen: to clients mirroring us (host mode) or upstream (peer mode). */
@@ -700,10 +720,8 @@ function sendMirrorFrame(only?: WebSocket): void {
   if (only) {
     // On-subscribe snapshot: always a full keyframe so a new viewer isn't blank.
     if (only.readyState === 1) {
-      const p = fullFramePayload();
-      only.send(p);
+      sendMirrorPayload(only, fullFramePayload());
       mirrorClientState().set(only, { lines: lastMirrorFrame.lines.slice(), width: lastMirrorFrame.width, height: lastMirrorFrame.height });
-      mirrorDebugAccount(p.length);
     }
     return;
   }
@@ -1848,7 +1866,7 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
       // Capability handshake. Cancel the deferred history replay; only send it
       // now if this client actually renders history (mirror-only clients don't).
       const mirrorOnly = cmd.mirrorOnly === true;
-      clientCaps().set(ws, { mirrorOnly, diff: cmd.diff === true });
+      clientCaps().set(ws, { mirrorOnly, diff: cmd.diff === true, deflate: cmd.deflate === true });
       const t = pendingHistory().get(ws);
       if (t) { clearTimeout(t); pendingHistory().delete(ws); }
       if (!mirrorOnly) sendHistory(ws);
@@ -1962,7 +1980,7 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
         // mirroring this peer, not the general broadcast.
         const framed = JSON.stringify({ ...payload, agentId: sourceAgentId });
         for (const [clientWs, target] of mirrorTargets()) {
-          if (target === sourceAgentId && clientWs.readyState === 1) clientWs.send(framed);
+          if (target === sourceAgentId && clientWs.readyState === 1) sendMirrorPayload(clientWs, framed);
         }
         break;
       }
