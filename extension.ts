@@ -65,7 +65,8 @@ import qrcodeTerminal from "qrcode-terminal";
 
 // ── Config ──────────────────────────────────────────────────────────────
 
-const DEFAULT_PORT = 8765;
+// Override with PI_REMOTE_PORT (isolated test hosts, multiple hosts per box).
+const DEFAULT_PORT = Number(process.env.PI_REMOTE_PORT) || 8765;
 
 // Shared-secret auth. Every WS connection must carry `?token=...`; mismatches
 // are closed with code 4001. Token resolution, in order:
@@ -299,6 +300,30 @@ let peerReconnectTimer: NodeJS.Timeout | null = null;
     }));
   },
   /**
+   * Deliver a downloadable file to all connected Android clients (save/share
+   * sheet on the device). Pass base64 `data` directly, or a `path` to read.
+   * 20MB cap. Any extension can call this; pair with a small tool to let the
+   * model send artifacts to the phone.
+   */
+  sendFile: (file: { name?: string; mimeType?: string; data?: string; path?: string }) => {
+    let data = file.data;
+    let name = file.name;
+    if (!data && file.path) {
+      const buf = fs.readFileSync(file.path);
+      if (buf.length > 20 * 1024 * 1024) throw new Error("sendFile: file exceeds 20MB cap");
+      data = buf.toString("base64");
+      name ||= path.basename(file.path);
+    }
+    if (!data) throw new Error("sendFile: provide data (base64) or path");
+    if (Buffer.byteLength(data, "base64") > 20 * 1024 * 1024) throw new Error("sendFile: file exceeds 20MB cap");
+    hostBcastClients(JSON.stringify({
+      type: "file",
+      name: name || "download.bin",
+      mimeType: file.mimeType ?? "application/octet-stream",
+      data,
+    }));
+  },
+  /**
    * Register a callback for remote TUI input (e.g., D-pad taps from Android).
    * Returns an unsubscribe function.
    */
@@ -436,6 +461,272 @@ function refreshRemoteStatus(): void {
   if (mode === "host") text = "remote · host";
   else if (mode === "peer") text = peerSock ? `remote · peer ${SELF_AGENT_NAME}` : "remote · connecting…";
   setRemoteStatus(text); // undefined when stopped → clears the chip
+}
+
+// ── Screen mirror ────────────────────────────────────────────────────────
+// Ships the TUI's composed frames (fork hook: tui.onFrame) to subscribed
+// clients and routes their keys/taps back via tui.injectInput. Categorical:
+// any surface that renders in the terminal renders on the phone, including
+// overlays, widgets, and SGR mouse clickables. Host pi only (v1).
+
+// Mirror frame cadence (~15fps). The phone-width render is the expensive part
+// (it thrashes pi's width-keyed markdown cache, forcing the desktop to
+// re-render), so we CAP it here and decouple it from desktop renders — a fast
+// desktop render must never trigger a phone render inline, or scrolling janks.
+const MIRROR_FRAME_MS = 66;
+// Backpressure ceiling: if a client socket already has this many bytes queued
+// (slow link — LTE/VPN), skip its frame this tick instead of piling on. The app
+// only renders the latest frame anyway, so a skip just means it gets a newer one
+// next tick. Without this, frames queue faster than the link drains and the user
+// watches a growing backlog of stale frames.
+const MIRROR_MAX_BUFFERED = 256 * 1024;
+// The phone-width render (renderMirrorNow) is a second, synchronous full render
+// at a DIFFERENT width than the desktop terminal. It both thrashes pi's
+// width-keyed markdown cache (so the desktop's next render is a cache miss) and
+// blocks Node's single thread for its whole duration. Running it ~15×/s while
+// the user scrolls the desktop is what makes desktop scrolling crawl. So: defer
+// the phone render while the desktop is actively rendering (scrolling), and only
+// render once the desktop has been quiet for DESKTOP_QUIET_MS — unless the mirror
+// has gone stale longer than MAX_DEFER_MS, so a continuously-busy desktop (e.g. a
+// running spinner) still lets the phone update, just at a lower rate.
+//
+// QUIET_MS is deliberately BELOW a typical spinner interval (~80ms): a scroll
+// fires desktop renders every few ms (gaps < QUIET → deferred), while a spinner
+// leaves ~80ms gaps (> QUIET → still renders), so steady agent work isn't throttled
+// but active scrolling is.
+const MIRROR_DESKTOP_QUIET_MS = 50;
+const MIRROR_MAX_DEFER_MS = 500;
+// Set PI_REMOTE_DEBUG=1 to log mirror throughput (KiB/s, fps, dropped frames).
+const MIRROR_DEBUG = process.env.PI_REMOTE_DEBUG === "1";
+let mirrorTui: any = null;          // live TUI instance, captured via widget probe
+let lastMirrorFrame: any = null;
+let mirrorSeq = 0;
+let mirrorDirty = false;            // a desktop render happened; mirror needs refresh
+let mirrorPump: NodeJS.Timeout | null = null;
+let lastDesktopRenderAt = 0;        // stamp of the most recent desktop doRender
+let lastMirrorSentAt = 0;           // stamp of the most recent phone frame sent
+// Debug throughput accounting (1s window), only used when MIRROR_DEBUG.
+let mirrorDbgBytes = 0, mirrorDbgFrames = 0, mirrorDbgDropped = 0, mirrorDbgAt = 0;
+function mirrorDebugAccount(bytes: number): void {
+  if (!MIRROR_DEBUG) return;
+  mirrorDbgBytes += bytes;
+  mirrorDbgFrames++;
+  const now = Date.now();
+  if (now - mirrorDbgAt >= 1000) {
+    console.log(`  [mirror] ${(mirrorDbgBytes / 1024).toFixed(1)} KiB/s · ${mirrorDbgFrames} fps · ${mirrorDbgDropped} dropped(backpressure)`);
+    mirrorDbgBytes = 0; mirrorDbgFrames = 0; mirrorDbgDropped = 0; mirrorDbgAt = now;
+  }
+}
+// Peer mode: the host asked us to stream our screen upstream (route_mirror).
+let peerMirrorOn = false;
+
+// Per-client mirror target (ws -> agentId). Lives on the persistent transport
+// object so a session reload (/new, /resume) keeps phones mirroring seamlessly.
+function mirrorTargets(): Map<WebSocket, string> {
+  return ((RC as any).mirrorTargets ??= new Map<WebSocket, string>());
+}
+
+// Per-client capabilities, learned from the `client_hello` it sends on connect.
+// `mirrorOnly` clients (the Android app) render the screen mirror and never the
+// message-list scrollback, so we skip the (large, twice-sent) history replay for
+// them — it was the bulk of connect latency. Old clients send no hello and keep
+// getting history via the fallback timer below.
+function clientCaps(): Map<WebSocket, { mirrorOnly: boolean; diff: boolean }> {
+  return ((RC as any).clientCaps ??= new Map<WebSocket, { mirrorOnly: boolean; diff: boolean }>());
+}
+// Pending history-replay timers, so a `client_hello` can cancel the deferred
+// send before it fires (and so we can clear it on disconnect).
+function pendingHistory(): Map<WebSocket, NodeJS.Timeout> {
+  return ((RC as any).pendingHistory ??= new Map<WebSocket, NodeJS.Timeout>());
+}
+
+// Last mirror frame actually SENT to each client, for row-level diffing. Stored
+// per-client (not globally) because the backpressure gate drops frames for slow
+// clients independently, so each client's diff base is whatever it last received.
+function mirrorClientState(): Map<WebSocket, { lines: string[]; width: number; height: number }> {
+  return ((RC as any).mirrorClientState ??= new Map<WebSocket, { lines: string[]; width: number; height: number }>());
+}
+// Changed rows between two frames: [{ i, t }] for every index whose text differs
+// (including new trailing rows). Removed trailing rows are conveyed by lineCount.
+function diffRows(oldLines: string[], newLines: string[]): Array<{ i: number; t: string }> {
+  const rows: Array<{ i: number; t: string }> = [];
+  for (let i = 0; i < newLines.length; i++) {
+    if (oldLines[i] !== newLines[i]) rows.push({ i, t: newLines[i] });
+  }
+  return rows;
+}
+
+// Produce a phone-width frame into lastMirrorFrame. This is the costly call (a
+// second full render at a different width); only the pump and the immediate
+// on-subscribe snapshot invoke it. Uses runtime-reachable private members
+// (render/compositeOverlays/extractCursorPosition/applyLineResets/overlayStack).
+function renderMirrorNow(): boolean {
+  const tui = mirrorTui;
+  if (!tui) return false;
+  try {
+    const termCols = tui.terminal?.columns ?? 80;
+    const height = tui.terminal?.rows ?? 24;
+    const width = clientCols > 0 ? clientCols : termCols;
+    let lines = tui.render(width);
+    if (tui.overlayStack?.length > 0) lines = tui.compositeOverlays(lines, width, height);
+    const cursor = tui.extractCursorPosition(lines, height);
+    lines = tui.applyLineResets(lines);
+    mirrorSeq++;
+    lastMirrorFrame = { lines, cursor, width, height };
+    return true;
+  } catch {
+    return false; // never let mirror capture break anything
+  }
+}
+
+// The pump: at most one phone-width render per MIRROR_FRAME_MS, and only when
+// something changed and someone is watching. This is what keeps desktop
+// scrolling smooth — doRender just flags dirty and returns.
+function ensureMirrorPump(): void {
+  if (mirrorPump) return;
+  mirrorPump = setInterval(() => {
+    if (!mirrorDirty || !selfHasMirrorAudience()) return;
+    // While the desktop user is scrolled back into history, skip the phone render
+    // ENTIRELY. pi-tui scrolls by shifting a cached slice (cheap); our
+    // renderMirrorNow() does a full phone-width re-compose that pi-tui itself
+    // flags as O(session length) "would make scrolling crawl" — running it ~15×/s
+    // fights the scroll for the event loop and thrashes the width-keyed cache.
+    // scrollSliceStart is -1 at the live tail, >=0 when scrolled (mouse wheel).
+    // mirrorDirty stays set, so we send a fresh frame the moment they return.
+    if (((mirrorTui as any)?.scrollSliceStart ?? -1) >= 0) return;
+    const now = Date.now();
+    // Otherwise, hold off the cache-thrashing phone render while the desktop is
+    // actively rendering — unless the mirror has been stale too long. Leave
+    // mirrorDirty set so the next tick (after the desktop quiets) picks it up.
+    const desktopActive = now - lastDesktopRenderAt < MIRROR_DESKTOP_QUIET_MS;
+    const staleFor = now - lastMirrorSentAt;
+    if (desktopActive && staleFor < MIRROR_MAX_DEFER_MS) return;
+    mirrorDirty = false;
+    if (renderMirrorNow()) { sendMirrorFrame(); lastMirrorSentAt = now; }
+  }, MIRROR_FRAME_MS);
+  mirrorPump.unref?.();
+}
+
+// Capture composed frames WITHOUT any fork hook: wrap the TUI's private
+// doRender (TS `private` is compile-time only, so it's reachable at runtime).
+// The hot path stays cheap — it only marks the mirror dirty; the throttled pump
+// does the actual phone-width render off the desktop render path.
+function attachMirror(tui: any): void {
+  if (!tui || mirrorTui === tui) return;
+  mirrorTui = tui;
+  ensureMirrorPump();
+  if (tui.__rcMirrorPatched) return;
+  tui.__rcMirrorPatched = true;
+
+  const origDoRender = tui.doRender?.bind(tui);
+  if (typeof origDoRender !== "function") return; // unexpected build; mirror stays off
+
+  tui.doRender = () => {
+    origDoRender(); // desktop render exactly as before — no extra work inline
+    if (selfHasMirrorAudience()) {
+      mirrorDirty = true;
+      lastDesktopRenderAt = Date.now(); // so the pump can defer during active scroll
+    }
+  };
+}
+
+// Mark the mirror for a refresh on the next pump tick (width/audience changes).
+function requestMirrorFrame(): void {
+  mirrorDirty = true;
+}
+
+// Inject keys/taps through the TUI's private input path (runtime-reachable).
+function injectMirrorInput(data: string): void {
+  try { mirrorTui?.handleInput?.(data); } catch { /* never crash on remote input */ }
+}
+
+function mirrorFramePayload(): Record<string, unknown> {
+  return {
+    type: "mirror_frame",
+    seq: mirrorSeq,
+    lines: lastMirrorFrame.lines,
+    cursor: lastMirrorFrame.cursor,
+    width: lastMirrorFrame.width,
+    height: lastMirrorFrame.height,
+  };
+}
+
+/** Full-frame (keyframe) payload string for a self-agent client. */
+function fullFramePayload(): string {
+  return JSON.stringify({ ...mirrorFramePayload(), agentId: SELF_AGENT_ID });
+}
+
+/** Send the current frame to one client as a row-diff (when it supports diffs and
+ *  we hold a same-geometry base for it) or a full keyframe, then record what it
+ *  received so the next diff is computed against exactly that. A frame skipped by
+ *  backpressure must NOT call this, so its base stays at the last frame it got. */
+function sendFrameToClient(ws: WebSocket): void {
+  const f = lastMirrorFrame;
+  const caps = clientCaps().get(ws);
+  const prev = mirrorClientState().get(ws);
+  const canDiff = !!caps?.diff && !!prev && prev.width === f.width && prev.height === f.height;
+  const payload = canDiff
+    ? JSON.stringify({
+        type: "mirror_diff",
+        agentId: SELF_AGENT_ID,
+        seq: mirrorSeq,
+        rows: diffRows(prev!.lines, f.lines),
+        lineCount: f.lines.length,
+        cursor: f.cursor,
+        width: f.width,
+        height: f.height,
+      })
+    : fullFramePayload();
+  ws.send(payload);
+  // Copy the lines: the stored base must not alias an array the renderer might
+  // reuse/mutate next frame, or diffs would come out empty.
+  mirrorClientState().set(ws, { lines: f.lines.slice(), width: f.width, height: f.height });
+  mirrorDebugAccount(payload.length);
+}
+
+/** Send OUR screen: to clients mirroring us (host mode) or upstream (peer mode). */
+function sendMirrorFrame(only?: WebSocket): void {
+  if (!lastMirrorFrame && !renderMirrorNow()) return; // ensure a frame exists
+  if (mode === "peer") {
+    if (peerMirrorOn && peerSock?.readyState === 1) {
+      peerSock.send(JSON.stringify({ type: "peer_event", agentId: SELF_AGENT_ID, payload: mirrorFramePayload() }));
+    }
+    return;
+  }
+  if (only) {
+    // On-subscribe snapshot: always a full keyframe so a new viewer isn't blank.
+    if (only.readyState === 1) {
+      const p = fullFramePayload();
+      only.send(p);
+      mirrorClientState().set(only, { lines: lastMirrorFrame.lines.slice(), width: lastMirrorFrame.width, height: lastMirrorFrame.height });
+      mirrorDebugAccount(p.length);
+    }
+    return;
+  }
+  for (const [ws, target] of mirrorTargets()) {
+    if (target !== SELF_AGENT_ID || ws.readyState !== 1) continue;
+    // Backpressure: skip this client's frame if its send buffer is backed up.
+    if (((ws as any).bufferedAmount ?? 0) > MIRROR_MAX_BUFFERED) { mirrorDbgDropped++; continue; }
+    sendFrameToClient(ws);
+  }
+}
+
+function selfHasMirrorAudience(): boolean {
+  if (mode === "peer") return peerMirrorOn;
+  for (const target of mirrorTargets().values()) {
+    if (target === SELF_AGENT_ID) return true;
+  }
+  return false;
+}
+
+/** Host: a client stopped mirroring `agentId` — tell the peer if nobody else watches. */
+function maybeStopPeerMirror(agentId: string): void {
+  if (agentId === SELF_AGENT_ID) return;
+  for (const target of mirrorTargets().values()) {
+    if (target === agentId) return;
+  }
+  const peerWs = peerConns.get(agentId);
+  if (peerWs?.readyState === 1) peerWs.send(JSON.stringify({ type: "route_mirror", on: false }));
 }
 
 function textFromContent(content: unknown): string {
@@ -1180,8 +1471,16 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
     // Send the current Pi theme palette so the phone UI mirrors the terminal
     sendCurrentTheme(ws);
     // Replay the full conversation so a fresh connect (or reconnect) shows the
-    // whole thread, not just events from this point forward.
-    sendHistory(ws);
+    // whole thread. Deferred briefly: a `client_hello` arriving in the next few
+    // hundred ms can cancel this (mirror-only clients don't render history, and
+    // shipping it ahead of the first mirror frame was the bulk of connect lag).
+    // No hello (old client) → the timer fires and history ships as before.
+    const histTimer = setTimeout(() => {
+      pendingHistory().delete(ws);
+      sendHistory(ws);
+    }, 300);
+    histTimer.unref?.();
+    pendingHistory().set(ws, histTimer);
 
     ws.on("message", (data: RawData) => {
       const text = data.toString();
@@ -1205,6 +1504,14 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
         console.log(`  [-] peer ${peerId} disconnected`);
       } else {
         clientConns.delete(ws);
+        const target = mirrorTargets().get(ws);
+        mirrorTargets().delete(ws);
+        clientCaps().delete(ws);
+        mirrorClientState().delete(ws);
+        const ht = pendingHistory().get(ws);
+        if (ht) { clearTimeout(ht); pendingHistory().delete(ws); }
+        if (target) maybeStopPeerMirror(target);
+        requestMirrorFrame(); // last mirror gone → next render reverts to desktop width
         console.log(`  [-] client disconnected (${clientConns.size} viewers)`);
       }
       hostBcastSessionList();
@@ -1533,6 +1840,53 @@ function executeSlashLocally(pi: ExtensionAPI, commandName: string, args: string
 
 function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSocket): void {
   switch (cmd.type as string) {
+    case "client_hello": {
+      // Capability handshake. Cancel the deferred history replay; only send it
+      // now if this client actually renders history (mirror-only clients don't).
+      const mirrorOnly = cmd.mirrorOnly === true;
+      clientCaps().set(ws, { mirrorOnly, diff: cmd.diff === true });
+      const t = pendingHistory().get(ws);
+      if (t) { clearTimeout(t); pendingHistory().delete(ws); }
+      if (!mirrorOnly) sendHistory(ws);
+      break;
+    }
+    case "mirror": {
+      // Subscribe/unsubscribe this client to composed-screen frames of one
+      // agent: the host itself (default) or any connected peer pi.
+      const agentId = (typeof cmd.agentId === "string" && cmd.agentId) || SELF_AGENT_ID;
+      const previous = mirrorTargets().get(ws);
+      if (cmd.on) {
+        mirrorTargets().set(ws, agentId);
+        if (previous && previous !== agentId) maybeStopPeerMirror(previous);
+        if (agentId === SELF_AGENT_ID) {
+          requestMirrorFrame();   // render a phone-width frame for this subscriber
+          sendMirrorFrame(ws);  // immediate snapshot so the view isn't blank
+        } else {
+          const peerWs = peerConns.get(agentId);
+          // Send the phone's width with the subscribe so the peer clamps too.
+          if (peerWs?.readyState === 1) peerWs.send(JSON.stringify({ type: "route_mirror", on: true, cols: clientCols }));
+        }
+      } else {
+        mirrorTargets().delete(ws);
+        if (previous) maybeStopPeerMirror(previous);
+        requestMirrorFrame();     // nobody mirroring us
+      }
+      break;
+    }
+    case "mirror_input": {
+      // Keys and SGR-encoded taps from the mirror view, injected through the
+      // target TUI's normal input path (shortcuts, click handlers, editor).
+      const data = typeof cmd.data === "string" ? cmd.data : "";
+      if (!data) break;
+      const agentId = (typeof cmd.agentId === "string" && cmd.agentId) || mirrorTargets().get(ws) || SELF_AGENT_ID;
+      if (agentId === SELF_AGENT_ID) {
+        injectMirrorInput(data);
+      } else {
+        const peerWs = peerConns.get(agentId);
+        if (peerWs?.readyState === 1) peerWs.send(JSON.stringify({ type: "route_mirror_input", data }));
+      }
+      break;
+    }
     case "viewport": {
       // App reports its width in monospace columns so we re-render pi's
       // components to fit the device. Clamp to a sane range.
@@ -1541,9 +1895,12 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
       const next = Math.max(20, Math.min(400, Math.floor(cols)));
       if (next === clientCols) break;
       clientCols = next;
+      requestMirrorFrame(); // re-render at the new phone width if mirroring us
       // Streams are rendered at the width current when each message was sent;
-      // a width change re-renders the whole scrollback via a history replay.
-      sendHistory(ws);
+      // a width change re-renders the whole scrollback via a history replay —
+      // but skip it for mirror-only clients, who never render that scrollback
+      // (this re-send was doubling the connect-time history cost on width report).
+      if (!clientCaps().get(ws)?.mirrorOnly) sendHistory(ws);
       // Peers render their own streams but never see viewport messages —
       // forward the width so their output fits the device too.
       for (const peerWs of peerConns.values()) {
@@ -1595,6 +1952,15 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
         if (payload.type === "turn_start" && typeof payload.turnIndex === "number") {
           agent.turnIndex = payload.turnIndex;
         }
+      }
+      if (payload.type === "mirror_frame") {
+        // Screen frames are high-volume and per-viewer: send only to clients
+        // mirroring this peer, not the general broadcast.
+        const framed = JSON.stringify({ ...payload, agentId: sourceAgentId });
+        for (const [clientWs, target] of mirrorTargets()) {
+          if (target === sourceAgentId && clientWs.readyState === 1) clientWs.send(framed);
+        }
+        break;
       }
       hostBcastClients(JSON.stringify({ ...payload, agentId: sourceAgentId }));
       if (payload.type === "agent_start" || payload.type === "agent_end") {
@@ -1825,6 +2191,23 @@ function handlePeerInbound(msg: Record<string, unknown>, pi: ExtensionAPI): void
       // Host forwarded the phone's viewport width so our rendered streams fit.
       const cols = Number(msg.cols);
       if (Number.isFinite(cols)) clientCols = Math.max(20, Math.min(400, Math.floor(cols)));
+      requestMirrorFrame(); // re-render at the new phone width if mirroring us
+      break;
+    }
+    case "route_mirror": {
+      // A phone is (or stopped) mirroring OUR screen via the host.
+      peerMirrorOn = msg.on === true;
+      const cols = Number(msg.cols);
+      if (peerMirrorOn && Number.isFinite(cols)) clientCols = Math.max(20, Math.min(400, Math.floor(cols)));
+      requestMirrorFrame(); // render at the phone width (or revert)
+      if (peerMirrorOn) sendMirrorFrame(); // immediate snapshot upstream
+      break;
+    }
+    case "route_mirror_input": {
+      const data = typeof msg.data === "string" ? msg.data : "";
+      if (data) {
+        injectMirrorInput(data);
+      }
       break;
     }
     // peer_ack and any other host->peer messages: ignored (no state to update)
@@ -1842,6 +2225,40 @@ export default function (pi: ExtensionAPI) {
   if (typeof (pi as any).getMessageRenderer !== "function") {
     console.log("[pi-remote-control] note: pi build does not expose getMessageRenderer/getToolDefinition — extension presentation mirroring disabled (text fallback).");
   }
+
+  // ── Tools ─────────────────────────────────────────────────────────────
+
+  pi.registerTool({
+    name: "send_file_to_phone",
+    label: "SendFileToPhone",
+    description:
+      "Send a file from this machine to the user's connected phone (pi-remote-control app), where it appears " +
+      "as a save/share dialog. Use when the user asks to get a file onto their phone, or when delivering an " +
+      "artifact (export, report, image, build output) they should have on the device. 20MB cap.",
+    promptSnippet: "Deliver a file to the user's connected phone",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Absolute path of the file to send" },
+        name: { type: "string", description: "Optional display/file name (defaults to the basename)" },
+        mime_type: { type: "string", description: "Optional MIME type (defaults to application/octet-stream)" },
+      },
+      required: ["path"],
+      additionalProperties: false,
+    } as never,
+    async execute(_id: string, params: { path: string; name?: string; mime_type?: string }) {
+      if (clientConns.size === 0) {
+        return {
+          content: [{ type: "text", text: "No phone is connected — the file was not sent. The user can connect via the pi-remote-control app (/remote-qr shows the pairing code)." }],
+          isError: true,
+        };
+      }
+      (globalThis as any).__piRemote.sendFile({ path: params.path, name: params.name, mimeType: params.mime_type });
+      return {
+        content: [{ type: "text", text: `Sent ${params.path} to ${clientConns.size} connected device${clientConns.size === 1 ? "" : "s"} (save/share dialog on the phone).` }],
+      };
+    },
+  } as never);
 
   // ── Commands ──────────────────────────────────────────────────────────
 
@@ -2248,6 +2665,16 @@ export default function (pi: ExtensionAPI) {
     // re-assert it now — a re-imported session (/new, /resume) gets a fresh footer.
     selfUi = ctx.hasUI ? ctx.ui : null;
     refreshRemoteStatus();
+    // Capture the live TUI instance for the screen mirror. A widget factory is
+    // the only extension-visible path to it; this one renders nothing.
+    if (ctx.hasUI) {
+      try {
+        ctx.ui.setWidget("__remote-mirror-probe", (tui: any) => {
+          attachMirror(tui);
+          return { render: () => [], invalidate: () => {} };
+        }, { placement: "belowEditor" });
+      } catch { /* widget API unavailable — mirror stays off */ }
+    }
     // Capture the session manager so the session title (first user message /
     // /name) is right the moment the phone connects, before any agent turn.
     selfSm = ctx.sessionManager;
