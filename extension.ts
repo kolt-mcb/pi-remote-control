@@ -586,21 +586,25 @@ function ensureMirrorPump(): void {
   if (mirrorPump) return;
   mirrorPump = setInterval(() => {
     if (!mirrorDirty || !selfHasMirrorAudience()) return;
-    // While the desktop user is scrolled back into history, skip the phone render
-    // ENTIRELY. pi-tui scrolls by shifting a cached slice (cheap); our
-    // renderMirrorNow() does a full phone-width re-compose that pi-tui itself
-    // flags as O(session length) "would make scrolling crawl" — running it ~15×/s
-    // fights the scroll for the event loop and thrashes the width-keyed cache.
-    // scrollSliceStart is -1 at the live tail, >=0 when scrolled (mouse wheel).
-    // mirrorDirty stays set, so we send a fresh frame the moment they return.
-    if (((mirrorTui as any)?.scrollSliceStart ?? -1) >= 0) return;
     const now = Date.now();
-    // Otherwise, hold off the cache-thrashing phone render while the desktop is
-    // actively rendering — unless the mirror has been stale too long. Leave
-    // mirrorDirty set so the next tick (after the desktop quiets) picks it up.
-    const desktopActive = now - lastDesktopRenderAt < MIRROR_DESKTOP_QUIET_MS;
-    const staleFor = now - lastMirrorSentAt;
-    if (desktopActive && staleFor < MIRROR_MAX_DEFER_MS) return;
+    // The scroll-pause and desktop-render defer below exist to protect a HUMAN at
+    // the host's interactive terminal. A peer process has no interactive terminal,
+    // so it must stream every frame without deferring — deferring there was
+    // freezing peer mirrors. Only the host applies these.
+    if (mode === "host") {
+      // While the desktop user is scrolled back into history, skip the phone
+      // render ENTIRELY. pi-tui scrolls by shifting a cached slice (cheap); our
+      // renderMirrorNow() does a full phone-width re-compose that pi-tui itself
+      // flags as O(session length) "would make scrolling crawl" — running it
+      // ~15×/s fights the scroll for the event loop and thrashes the cache.
+      if (((mirrorTui as any)?.scrollSliceStart ?? -1) >= 0) return;
+      // Otherwise, hold off the cache-thrashing phone render while the desktop is
+      // actively rendering — unless the mirror has been stale too long. Leave
+      // mirrorDirty set so the next tick (after the desktop quiets) picks it up.
+      const desktopActive = now - lastDesktopRenderAt < MIRROR_DESKTOP_QUIET_MS;
+      const staleFor = now - lastMirrorSentAt;
+      if (desktopActive && staleFor < MIRROR_MAX_DEFER_MS) return;
+    }
     mirrorDirty = false;
     if (renderMirrorNow()) { sendMirrorFrame(); lastMirrorSentAt = now; }
   }, MIRROR_FRAME_MS);
