@@ -627,6 +627,9 @@ function renderMirrorNow(): boolean {
     }
     const cursor = tui.extractCursorPosition(lines, height);
     lines = tui.applyLineResets(lines);
+    // Swap any "[Image: ...]" text placeholder for the real image escape so the
+    // phone shows show_image_to_phone images inline (the host terminal can't).
+    lines = substituteInlineImages(lines);
     mirrorSeq++;
     lastMirrorFrame = { lines, cursor, width, height };
     return true;
@@ -1437,10 +1440,62 @@ function renderToolStreams(
 // appends those after the stream.
 const OSC_IMAGE_MAX_B64 = 8 * 1024 * 1024;
 
+// MIME for an image we can render inline; undefined for anything else.
+function imageMimeFromExt(filePath: string): string | undefined {
+  switch (path.extname(filePath).toLowerCase()) {
+    case ".png": return "image/png";
+    case ".jpg":
+    case ".jpeg": return "image/jpeg";
+    case ".gif": return "image/gif";
+    case ".webp": return "image/webp";
+    default: return undefined;
+  }
+}
+
 function osc1337ImageLine(img: { data: string; mimeType: string }): string | undefined {
   if (!img.data || img.data.length > OSC_IMAGE_MAX_B64) return undefined;
   const size = Buffer.byteLength(img.data, "base64");
   return `\x1b]1337;File=inline=1;size=${size};mime=${img.mimeType || "image/png"};width=auto:${img.data}\x1b\\`;
+}
+
+// ── Inline image bridge for the mirror ──────────────────────────────────────
+// pi-tui only builds an Image component / emits kitty when the LOCAL terminal
+// reports image support, and that decision is made when the message is built,
+// not when it's rendered. The host/peer terminal is image-incapable (xterm), so
+// a show_image_to_phone tool result renders only as pi-tui's "[Image: <mime>]
+// WxH" TEXT fallback — even in the phone-width mirror render, since forcing caps
+// at render time is too late. So instead we stash the real image escape (keyed by
+// pixel dimensions, which appear verbatim in that fallback text) and swap the
+// placeholder line for the escape in the mirror frame only. The host's own
+// terminal still shows the text fallback. Lives on globalThis so it survives
+// extension reloads (/new, /resume).
+function inlineImageStore(): Map<string, string> {
+  return ((globalThis as any).__piRemoteInlineImages ??= new Map<string, string>());
+}
+
+// "WxH" from a PNG's IHDR — the dims pi-tui prints in the [Image: ...] fallback.
+// PNG signature is 8 bytes; IHDR width is at byte 16, height at 20 (big-endian).
+function pngDimsKey(buf: Buffer): string | undefined {
+  if (buf.length < 24 || buf.readUInt32BE(0) !== 0x89504e47) return undefined;
+  return `${buf.readUInt32BE(16)}x${buf.readUInt32BE(20)}`;
+}
+
+// pi-tui's imageFallback can bracket the mime ("[Image: [image/png] 2083x1475]"),
+// so we just locate the WxH dimensions inside an [Image: ...] placeholder.
+const IMAGE_FALLBACK_RE = /\[Image:[^\]]*\]?\s*(\d+)x(\d+)/;
+
+// Swap any "[Image: ...] WxH" placeholder line for the stashed real image escape
+// (the phone renders OSC 1337 inline). Only rewrites lines we have an image for;
+// everything else passes through. Mirror-only — never touches the host terminal.
+function substituteInlineImages(lines: string[]): string[] {
+  const store = inlineImageStore();
+  if (store.size === 0) return lines;
+  return lines.map((line) => {
+    if (!line.includes("[Image:")) return line;
+    const m = IMAGE_FALLBACK_RE.exec(line);
+    const esc = m && store.get(`${m[1]}x${m[2]}`);
+    return esc || line;
+  });
 }
 
 // Append embeddable images to [stream] as OSC lines; return the leftovers
@@ -2370,6 +2425,72 @@ export default function (pi: ExtensionAPI) {
       (globalThis as any).__piRemote.sendFile({ path: params.path, name: params.name, mimeType: params.mime_type });
       return {
         content: [{ type: "text", text: `Sent ${params.path} to ${phones} connected device${phones === 1 ? "" : "s"} (save/share dialog on the phone).` }],
+      };
+    },
+  } as never);
+
+  pi.registerTool({
+    name: "show_image_to_phone",
+    label: "ShowImageToPhone",
+    description:
+      "Display an image INLINE in the conversation — it appears as a scrollable image in the chat (on the user's " +
+      "connected phone via the pi-remote-control app, and in the terminal). Use this to SHOW the user a plot, " +
+      "chart, diagram, or screenshot in context. To hand over a downloadable file instead (save/share dialog), " +
+      "use send_file_to_phone. PNG/JPEG/GIF/WebP, 10MB cap.",
+    promptSnippet: "Show an image inline in the conversation",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Absolute path of the image file to display" },
+        caption: { type: "string", description: "Optional caption shown with the image" },
+      },
+      required: ["path"],
+      additionalProperties: false,
+    } as never,
+    async execute(_id: string, params: { path: string; caption?: string }) {
+      const name = path.basename(params.path);
+      const mimeType = imageMimeFromExt(params.path);
+      if (!mimeType) {
+        return {
+          content: [{ type: "text", text: `${name} isn't a supported inline image (png/jpeg/gif/webp). Use send_file_to_phone to deliver other files.` }],
+          isError: true,
+        };
+      }
+      let data: string;
+      let buf: Buffer;
+      try {
+        buf = fs.readFileSync(params.path);
+        data = buf.toString("base64");
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `Could not read ${params.path}: ${e?.message ?? e}` }], isError: true };
+      }
+      if (data.length > OSC_IMAGE_MAX_B64) {
+        return {
+          content: [{ type: "text", text: `${name} is too large to show inline (~${Math.round(data.length / 1.4e6)}MB). Use send_file_to_phone to deliver it as a download instead.` }],
+          isError: true,
+        };
+      }
+      // Return the image as tool-result content so pi records it in the
+      // conversation (the vision-capable model sees it too). The host terminal is
+      // image-incapable, so pi-tui only renders a "[Image: ...]" text placeholder;
+      // stash the real image escape keyed by pixel dimensions so the mirror render
+      // can swap it in and the phone shows it inline + scrolling. PNG dims come
+      // straight from the IHDR and match pi-tui's placeholder exactly; other
+      // formats fall back to the placeholder (send_file_to_phone still works).
+      const escLine = osc1337ImageLine({ data, mimeType });
+      const dimsKey = mimeType === "image/png" ? pngDimsKey(buf) : undefined;
+      if (escLine && dimsKey) inlineImageStore().set(dimsKey, escLine);
+      const phones = mode === "host" ? clientConns.size : hostClientCount;
+      const note = params.caption?.trim()
+        ? params.caption.trim()
+        : phones > 0
+          ? `Showing ${name} in the conversation (visible on ${phones} connected phone${phones === 1 ? "" : "s"}).`
+          : `Showing ${name} in the conversation. No phone is connected yet — it'll appear when one connects to this session.`;
+      return {
+        content: [
+          { type: "text", text: note },
+          { type: "image", data, mimeType },
+        ],
       };
     },
   } as never);
