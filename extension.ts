@@ -443,6 +443,26 @@ function box(title: string, lines: string[]): string[] {
   return [top, ...body, bottom];
 }
 
+// Render a scannable QR block to the host terminal. Both the startup banner
+// and the /remote-qr command route through here so they look identical and
+// stay in sync. Framed with ━ dividers + a heading so connection log lines
+// ([+] client connected, [*] peer joined) don't tangle with the code, and the
+// URL is printed plain below the QR as a copy/paste / manual-entry fallback.
+// Terminal-only by design — never injected into the pi conversation (see the
+// startHost listening handler for the rationale).
+function printQrBlock(url: string, heading: string): void {
+  const sep = "━".repeat(50);
+  console.log();
+  console.log(sep);
+  console.log(`  ${heading}\n`);
+  qrcodeTerminal.generate(url, { small: true }, (qr: string) => {
+    console.log(qr);
+    console.log();
+    console.log(`  ${url}`);
+    console.log(`${sep}\n`);
+  });
+}
+
 // The label the app shows for this session. Mirrors pi's /resume list:
 // an explicit /name, else the first user message, else the agent's short id.
 let selfTitle = SELF_AGENT_NAME;
@@ -704,6 +724,13 @@ function requestMirrorFrame(): void {
 // Inject keys/taps through the TUI's private input path (runtime-reachable).
 function injectMirrorInput(data: string): void {
   try { mirrorTui?.handleInput?.(data); } catch { /* never crash on remote input */ }
+  // Interactive prompts (select lists, AskUserQuestion, the editor) redraw via
+  // incremental cursor writes rather than tui.doRender, so the mirror-dirty hook
+  // (attachMirror) never fires while you navigate them — the phone goes stale even
+  // though the desktop updates. Drive a refresh off the input itself; the delayed
+  // follow-up catches redraws that land asynchronously after handleInput.
+  requestMirrorFrame();
+  setTimeout(requestMirrorFrame, MIRROR_FRAME_MS);
 }
 
 function mirrorFramePayload(): Record<string, unknown> {
@@ -1568,7 +1595,10 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
     mode = "host";
     upsertSelfAgent();
     refreshRemoteStatus(); // "remote · host" chip in the footer
-    console.log("\n" + box("Pi Remote Control (host)", [url]).join("\n"));
+    // Banner shows only the compact base address so the box stays narrow and
+    // survives split/narrow terminals; the full URL (with token + fingerprint)
+    // is printed under the QR by printQrBlock below.
+    console.log("\n" + box("Pi Remote Control (host)", [`wss://${ip}:${DEFAULT_PORT}`]).join("\n"));
     // Honest one-line summary of the auth state so the user knows what's
     // protecting (or not protecting) their pi.
     switch (AUTH_TOKEN_SOURCE) {
@@ -1592,7 +1622,6 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
     const certSrc = TLS.source === "loaded" ? CERT_FILE : `NEW self-signed cert generated and stored at ${CERT_FILE}`;
     console.log(`  tls:  ${certSrc}`);
     console.log(`  fingerprint: sha256:${fpShort} (full value pinned in the QR)`);
-    console.log();
     // Render a QR code the Android app can scan. The Android scanner accepts
     // ws://, wss://, piremote://, and bare host:port; we use ws:// so a
     // generic QR scanner (camera app) also recognises it as a URL.
@@ -1600,9 +1629,7 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
     // (or any [Remote] status) into the pi conversation — it clutters the chat
     // and, in peer/subagent pis, floods it with noise. The host's terminal is
     // where you scan the code.
-    qrcodeTerminal.generate(url, { small: true }, (qr: string) => {
-      console.log(qr);
-    });
+    printQrBlock(url, "Scan this QR with your phone");
   });
 
   server.on("connection", (ws: WebSocket, req: IncomingMessage) => {
@@ -2512,20 +2539,7 @@ export default function (pi: ExtensionAPI) {
     handler: async () => {
       const ip = localIP();
       const url = urlWithToken(`wss://${ip}:${DEFAULT_PORT}`);
-      // Print a visible divider + QR so the code isn't lost behind the
-      // input line.  The URL is printed AFTER the QR code (phone can
-      // tap-and-hold to copy it) as a fallback for scanning.
-      const sep = "━".repeat(50);
-      console.log();
-      console.log(`${sep}`);
-      console.log(`  Scan this QR with your phone\n`);
-      qrcodeTerminal.generate(url, { small: true }, (qr: string) => {
-        console.log(qr);
-        console.log();
-        // Full URL always visible as backup
-        console.log(`  ${url}`);
-        console.log(`${sep}\n`);
-      });
+      printQrBlock(url, "Scan this QR with your phone");
     },
   });
 
@@ -2563,10 +2577,12 @@ export default function (pi: ExtensionAPI) {
   pi.on("turn_start", async (e) => {
     localTurnIndex = e.turnIndex;
     emitAgentEvent({ type: "turn_start", turnIndex: e.turnIndex });
+    requestMirrorFrame(); // drive mirror liveness from content, not just doRender
   });
 
   pi.on("turn_end", async (e) => {
     emitAgentEvent({ type: "turn_end", turnIndex: e.turnIndex });
+    requestMirrorFrame();
   });
 
   pi.on("compactionStart", async () => {
@@ -2650,6 +2666,7 @@ export default function (pi: ExtensionAPI) {
       type: "message_end",
       message: msgPayload,
     });
+    requestMirrorFrame();
   });
 
   // Accumulate streaming deltas so text_end / thinking_end can ship the final
@@ -2675,6 +2692,9 @@ export default function (pi: ExtensionAPI) {
   pi.on("message_update", async (e: any) => {
     const evt = e.assistantMessageEvent;
     if (!evt) return;
+    // Mark the mirror dirty on every streaming delta so the phone updates live
+    // even when the desktop TUI isn't repainting; the 66ms pump throttles it.
+    requestMirrorFrame();
     switch (evt.type) {
       case "text_start":
         liveText = "";
