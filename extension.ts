@@ -446,7 +446,7 @@ function box(title: string, lines: string[]): string[] {
 // Render a scannable QR block to the host terminal. Both the startup banner
 // and the /remote-qr command route through here so they look identical and
 // stay in sync. Framed with ━ dividers + a heading so connection log lines
-// ([+] client connected, [*] peer joined) don't tangle with the code, and the
+// (client connect/disconnect events) don't tangle with the code, and the
 // URL is printed plain below the QR as a copy/paste / manual-entry fallback.
 // Terminal-only by design — never injected into the pi conversation (see the
 // startHost listening handler for the rationale).
@@ -482,7 +482,7 @@ function setRemoteStatus(text: string | undefined): void {
 // (and on session_start, so a re-imported session re-shows it on the new footer).
 function refreshRemoteStatus(): void {
   let text: string | undefined;
-  if (mode === "host") text = "remote · host";
+  if (mode === "host") text = `remote · host · ${clientConns.size} viewer${clientConns.size === 1 ? "" : "s"}`;
   else if (mode === "peer") text = peerSock ? `remote · peer ${SELF_AGENT_NAME}` : "remote · connecting…";
   setRemoteStatus(text); // undefined when stopped → clears the chip
 }
@@ -520,6 +520,17 @@ const MIRROR_MAX_BUFFERED = 256 * 1024;
 // but active scrolling is.
 const MIRROR_DESKTOP_QUIET_MS = 50;
 const MIRROR_MAX_DEFER_MS = 500;
+// While a phone is actively typing it is WAITING for its keystroke to echo, so the
+// MAX_DEFER batching (which exists to keep a desktop human's scroll/render smooth)
+// becomes the dominant source of input lag — up to MAX_DEFER ms per keystroke. Bypass
+// that batching while remote input is recent AND the phone-width render is cheap. The
+// render-cost guard matters because renderMirrorNow() at phone width busts pi-tui's
+// single-slot per-component width cache; on a huge, heavily-wrapped buffer that thrash
+// makes each render expensive, and rendering it ~15x/s would fight the event loop (the
+// very thing MAX_DEFER guards). So: snappy typing on normal sessions, graceful fallback
+// to batching on pathological ones.
+const MIRROR_INPUT_ACTIVE_MS = 400;   // treat the phone as "typing" for this long after input
+const MIRROR_CHEAP_RENDER_MS = 40;    // only bypass the defer when renders are at/below this
 // Deflate mirror payloads (sent as binary WS frames) once they exceed this many
 // bytes — ANSI text compresses ~5-10x. The big win is the initial keyframe (full
 // buffer) and full peer frames; tiny diffs stay as uncompressed text (not worth
@@ -538,16 +549,32 @@ let mirrorDirty = false;            // a desktop render happened; mirror needs r
 let mirrorPump: NodeJS.Timeout | null = null;
 let lastDesktopRenderAt = 0;        // stamp of the most recent desktop doRender
 let lastMirrorSentAt = 0;           // stamp of the most recent phone frame sent
+let lastMirrorInputAt = 0;          // stamp of the most recent remote (phone) input
+let lastMirrorRenderMs = 0;         // duration of the most recent renderMirrorNow()
 // Debug throughput accounting (1s window), only used when MIRROR_DEBUG.
 let mirrorDbgBytes = 0, mirrorDbgFrames = 0, mirrorDbgDropped = 0, mirrorDbgAt = 0;
+// Render-cost + diff/keyframe split, so we can tell HOST render CPU apart from
+// wire payload: renderMirrorNow() ms (sum/max), how many sends went out as tiny
+// diffs vs full keyframes, and how big the rendered buffer is.
+let mirrorDbgRenderMs = 0, mirrorDbgRenderMax = 0, mirrorDbgRenders = 0;
+let mirrorDbgDiffs = 0, mirrorDbgKeyframes = 0, mirrorDbgLines = 0;
+function mirrorDebugRender(ms: number, lines: number): void {
+  if (!MIRROR_DEBUG) return;
+  mirrorDbgRenderMs += ms; mirrorDbgRenders++; mirrorDbgLines = lines;
+  if (ms > mirrorDbgRenderMax) mirrorDbgRenderMax = ms;
+}
 function mirrorDebugAccount(bytes: number): void {
   if (!MIRROR_DEBUG) return;
   mirrorDbgBytes += bytes;
   mirrorDbgFrames++;
   const now = Date.now();
   if (now - mirrorDbgAt >= 1000) {
+    const avgRender = mirrorDbgRenders ? (mirrorDbgRenderMs / mirrorDbgRenders).toFixed(1) : "0";
     console.log(`  [mirror] ${(mirrorDbgBytes / 1024).toFixed(1)} KiB/s · ${mirrorDbgFrames} fps · ${mirrorDbgDropped} dropped(backpressure)`);
+    console.log(`  [mirror] render ${avgRender}ms avg / ${mirrorDbgRenderMax}ms max · ${mirrorDbgLines} lines · sends: ${mirrorDbgDiffs} diff + ${mirrorDbgKeyframes} keyframe`);
     mirrorDbgBytes = 0; mirrorDbgFrames = 0; mirrorDbgDropped = 0; mirrorDbgAt = now;
+    mirrorDbgRenderMs = 0; mirrorDbgRenderMax = 0; mirrorDbgRenders = 0;
+    mirrorDbgDiffs = 0; mirrorDbgKeyframes = 0;
   }
 }
 // Peer mode: the host asked us to stream our screen upstream (route_mirror).
@@ -616,6 +643,7 @@ function diffRows(oldLines: string[], newLines: string[]): Array<{ i: number; t:
 function renderMirrorNow(): boolean {
   const tui = mirrorTui;
   if (!tui) return false;
+  const renderT0 = Date.now();
   try {
     const termCols = tui.terminal?.columns ?? 80;
     const height = tui.terminal?.rows ?? 24;
@@ -637,21 +665,35 @@ function renderMirrorNow(): boolean {
       } catch { saved = undefined; }
     }
     let lines: string[];
+    let dbgRaw = 0, dbgOverlay = 0;
     try {
       lines = tui.render(width);
+      dbgRaw = lines.length;
       if (tui.overlayStack?.length > 0) lines = tui.compositeOverlays(lines, width, height);
+      dbgOverlay = lines.length;
     } finally {
       if (saved !== undefined) {
         try { require("@earendil-works/pi-tui").setCapabilities(saved); } catch { /* ignore */ }
       }
     }
     const cursor = tui.extractCursorPosition(lines, height);
+    const dbgAfterCursor = lines.length;
     lines = tui.applyLineResets(lines);
+    const dbgAfterResets = lines.length;
     // Swap any "[Image: ...]" text placeholder for the real image escape so the
     // phone shows show_image_to_phone images inline (the host terminal can't).
     lines = substituteInlineImages(lines);
+    if (MIRROR_DEBUG) {
+      try {
+        require("fs").appendFileSync("/tmp/mirror_dbg.log",
+          `final=${lines.length} raw=${dbgRaw} overlay=${dbgOverlay} afterCursor=${dbgAfterCursor} afterResets=${dbgAfterResets}` +
+          ` width=${width} clientCols=${clientCols} termCols=${termCols} overlays=${tui.overlayStack?.length ?? 0} forceImages=${forceImages} scrollSlice=${(tui as any)?.scrollSliceStart ?? -1}\n`);
+      } catch { /* ignore */ }
+    }
     mirrorSeq++;
     lastMirrorFrame = { lines, cursor, width, height };
+    lastMirrorRenderMs = Date.now() - renderT0;
+    if (MIRROR_DEBUG) mirrorDebugRender(lastMirrorRenderMs, lines.length);
     return true;
   } catch {
     return false; // never let mirror capture break anything
@@ -682,7 +724,13 @@ function ensureMirrorPump(): void {
       // mirrorDirty set so the next tick (after the desktop quiets) picks it up.
       const desktopActive = now - lastDesktopRenderAt < MIRROR_DESKTOP_QUIET_MS;
       const staleFor = now - lastMirrorSentAt;
-      if (desktopActive && staleFor < MIRROR_MAX_DEFER_MS) return;
+      // While the phone is actively typing it's waiting on each keystroke to echo, so
+      // don't sit on the frame for up to MAX_DEFER ms — but only when renders are cheap
+      // enough that running them at pump cadence won't thrash the event loop (see
+      // MIRROR_INPUT_ACTIVE_MS / MIRROR_CHEAP_RENDER_MS).
+      const phoneTyping = now - lastMirrorInputAt < MIRROR_INPUT_ACTIVE_MS
+        && lastMirrorRenderMs <= MIRROR_CHEAP_RENDER_MS;
+      if (desktopActive && staleFor < MIRROR_MAX_DEFER_MS && !phoneTyping) return;
       // No point doing the O(session) phone-width render if every viewer is
       // congested and would just drop it — leave mirrorDirty set and wait.
       if (!anyClientCanReceiveMirror()) return;
@@ -721,9 +769,54 @@ function requestMirrorFrame(): void {
   mirrorDirty = true;
 }
 
+// The TUI's handleInput expects ONE keystroke event per call (a keybinding
+// match is exact, not a scan): a run of control bytes in a single chunk —
+// e.g. the app's autocorrect repair sending DEL×3 as "\x7f\x7f\x7f" — matches
+// no binding, falls through to the printable branch (0x7f ≥ 32), and gets
+// INSERTED into the prompt as literal tofu boxes. Split a mirror_input chunk
+// into keystroke-sized events: escape sequences stay whole (arrows, SGR
+// taps), each control byte is its own event, printable runs stay together
+// (multi-char insert is supported). Bracketed paste passes through untouched —
+// its content is literal by definition and the editor buffers it itself.
+function splitInputEvents(data: string): string[] {
+  if (data.includes("\x1b[200~")) return [data];
+  const events: string[] = [];
+  let i = 0;
+  while (i < data.length) {
+    const code = data.charCodeAt(i);
+    if (data[i] === "\x1b") {
+      // CSI: ESC [ params… final-byte(0x40–0x7e); SS3: ESC O X; else alt-chord ESC+char.
+      let j = i + 1;
+      if (data[j] === "[") {
+        j++;
+        while (j < data.length && !(data.charCodeAt(j) >= 0x40 && data.charCodeAt(j) <= 0x7e)) j++;
+        if (j < data.length) j++;
+      } else if (data[j] === "O") {
+        j = Math.min(j + 2, data.length);
+      } else if (j < data.length) {
+        j++;
+      }
+      events.push(data.slice(i, j));
+      i = j;
+    } else if (code < 0x20 || code === 0x7f) {
+      events.push(data[i]);
+      i++;
+    } else {
+      let j = i + 1;
+      while (j < data.length && data.charCodeAt(j) >= 0x20 && data.charCodeAt(j) !== 0x7f && data[j] !== "\x1b") j++;
+      events.push(data.slice(i, j));
+      i = j;
+    }
+  }
+  return events;
+}
+
 // Inject keys/taps through the TUI's private input path (runtime-reachable).
 function injectMirrorInput(data: string): void {
-  try { mirrorTui?.handleInput?.(data); } catch { /* never crash on remote input */ }
+  lastMirrorInputAt = Date.now(); // phone is actively driving; pump skips the defer
+  try {
+    for (const ev of splitInputEvents(data)) mirrorTui?.handleInput?.(ev);
+  } catch { /* never crash on remote input */ }
   // Interactive prompts (select lists, AskUserQuestion, the editor) redraw via
   // incremental cursor writes rather than tui.doRender, so the mirror-dirty hook
   // (attachMirror) never fires while you navigate them — the phone goes stale even
@@ -785,6 +878,7 @@ function sendFrameToClient(ws: WebSocket): void {
         height: f.height,
       })
     : fullFramePayload();
+  if (MIRROR_DEBUG) { if (canDiff) mirrorDbgDiffs++; else mirrorDbgKeyframes++; }
   sendMirrorPayload(ws, payload);
   // Copy the lines: the stored base must not alias an array the renderer might
   // reuse/mutate next frame, or diffs would come out empty.
@@ -1645,8 +1739,7 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
     // Default new connection to client; promoted to peer on peer_hello.
     clientConns.add(ws);
     notifyPeersClientCount();
-    const inferredName = parseNameFromUrl(req.url, "viewer");
-    console.log(`  [+] client connected (${clientConns.size} viewers, ${peerConns.size} peers) ${inferredName}`);
+    refreshRemoteStatus();
 
     hostBcastClients(JSON.stringify({ type: "connected", clients: clientConns.size }));
     hostBcastSessionList();
@@ -1684,7 +1777,6 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
         agents.delete(peerId);
         peerPids.delete(peerId);
         wsToPeerId.delete(ws);
-        console.log(`  [-] peer ${peerId} disconnected`);
       } else {
         clientConns.delete(ws);
         notifyPeersClientCount();
@@ -1696,8 +1788,8 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
         if (ht) { clearTimeout(ht); pendingHistory().delete(ws); }
         if (target) maybeStopPeerMirror(target);
         requestMirrorFrame(); // last mirror gone → next render reverts to desktop width
-        console.log(`  [-] client disconnected (${clientConns.size} viewers)`);
       }
+      refreshRemoteStatus();
       hostBcastSessionList();
     };
 
@@ -2118,8 +2210,8 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
         turnIndex: 0,
         pid: peerPid ?? undefined,
       });
-      console.log(`  [*] peer joined: ${peerId} (${name})`);
       ws.send(JSON.stringify({ type: "peer_ack", hostAgentId: SELF_AGENT_ID, clients: clientConns.size }));
+      refreshRemoteStatus();
       hostBcastSessionList();
       break;
     }
@@ -2229,32 +2321,37 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
     // ── Spawn a second pi process as a peer ────────────────────────
     case "spawn_peer": {
       const sessionPath = typeof cmd.sessionPath === "string" ? cmd.sessionPath : "";
+      const cwd = typeof cmd.cwd === "string" && cmd.cwd ? cmd.cwd : "";
       // setsid+script provides a fake PTY; detached process survives parent pi exit.
       const logPath = `/tmp/pi-peer-${randomUUID().slice(0, 6)}.log`;
-      // Shell-escape the sessionPath for script -c command string.
+      // Shell-escape the sessionPath and cwd for script -c command string.
       const escapedPath = sessionPath ? sessionPath.replace(/'/g, "'\\''") : "";
+      const escapedCwd = cwd ? cwd.replace(/'/g, "'\\''") : "";
       const piCmd = sessionPath ? `pi --session '${escapedPath}'` : "pi";
+      // Prepend cd into the chosen working directory.
+      const shellCmd = escapedCwd ? `cd '${escapedCwd}' && ${piCmd}` : piCmd;
       try {
         const child = spawnChild(
           "setsid",
-          ["script", "-qfc", piCmd, logPath],
+          ["script", "-qfc", shellCmd, logPath],
           {
             detached: true,
             stdio: "ignore",
             env: process.env,
-            cwd: process.cwd(),
+            cwd: cwd || process.cwd(),
           },
         );
         child.unref();
+        const peerCwd = cwd || process.cwd();
         const label = sessionPath ? `pi --session ${sessionPath}` : "pi";
-        console.log(`  [*] spawned peer (pid=${child.pid}, log=${logPath}): ${label}`);
+        console.log(`  [*] spawned peer (pid=${child.pid}, log=${logPath}): ${label} [cwd=${peerCwd}]`);
         hostBcastClients(JSON.stringify({
           type: "extension_ui_request",
           method: "notify",
           id: `notify_peer_${Date.now()}`,
           message: sessionPath
-            ? `Resuming saved session as a new peer…`
-            : `Launching a new pi peer… it'll join shortly.`,
+            ? `Resuming saved session as a new peer (cwd: ${peerCwd})…`
+            : `Launching a new pi peer in ${peerCwd}…`,
           notifyType: "info",
         }));
       } catch (e: any) {
@@ -2266,6 +2363,30 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
           message: `Couldn't spawn peer: ${e?.message ?? "unknown error"}`,
           notifyType: "error",
         }));
+      }
+      break;
+    }
+    // ── List host directories (for the Android "browse folder" picker) ──
+    case "list_host_dirs": {
+      const base = typeof cmd.base === "string" ? cmd.base : "";
+      const target = base || process.cwd();
+      try {
+        const entries = fs.readdirSync(target, { withFileTypes: true });
+        const dirs = entries
+          .filter((e) => e.isDirectory())
+          .map((e) => ({ name: e.name, path: path.join(target, e.name) }))
+          .sort((a, b) => a.name.localeCompare(b.name));
+        const resp = {
+          type: "host_dirs",
+          path: target,
+          dirs,
+        };
+        if (ws.readyState === 1) ws.send(JSON.stringify(resp));
+      } catch (e: any) {
+        console.warn(`list_host_dirs: ${e?.message ?? e}`);
+        if (ws.readyState === 1) {
+          ws.send(JSON.stringify({ type: "host_dirs_error", message: e?.message ?? "unknown" }));
+        }
       }
       break;
     }
