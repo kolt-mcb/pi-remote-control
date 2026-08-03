@@ -12,8 +12,6 @@ The reference client is the Android app at
 [`kolt-mcb/pi-remote-control-app`](https://github.com/kolt-mcb/pi-remote-control-app);
 the protocol is plain WS + JSON, so anything that can speak it works.
 
-Runs on **stock upstream pi** — no fork, no patches.
-
 <p align="center">
   <img src="docs/mirror-demo.gif" width="360"
        alt="A live pi session mirrored on a phone: streaming agent output, session tabs, terminal keyboard">
@@ -207,5 +205,4 @@ changes by a few days.
 ## Acknowledgements
 
 - [pi](https://github.com/earendil-works/pi) by Mario Zechner — the CLI
-  coding agent this extension hooks into, whose extension API makes all of
-  this possible without patching.
+  coding agent this extension hooks into.

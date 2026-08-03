@@ -6,7 +6,7 @@
  * cert fingerprint, and mirrors the live TUI to any connected client:
  * frames are re-rendered at the client's column width, row-diffed, deflated,
  * and streamed; client keystrokes are injected back through pi's own input
- * path. Runs on stock upstream pi — no patches required.
+ * path.
  *
  * Also provides: multi-session support (a second pi on the same host joins as
  * a peer over the same port, and clients can view/drive either), conversation
@@ -60,7 +60,7 @@ import { getCapabilities, Markdown, setCapabilities, Text as TuiText } from "@ea
 // fails loudly — a renamed TUI member means a blank mirror, which we report. A
 // missed invalidation here fails QUIETLY AND WRONGLY: stale or garbled text, in
 // the user's own terminal, because patching the prototype changes the desktop
-// render too. Opt in, measure, and prefer the upstream fix.
+// render too. Opt in and measure.
 const WIDTH_CACHE_MAX = 4;    // desktop + a few distinct client widths
 function addWidthCache(Cls: any): boolean {
   if (!Cls?.prototype?.render || Cls.prototype.__rcWidthCached) return false;
@@ -113,8 +113,8 @@ if (process.env.PI_REMOTE_WIDTH_CACHE === "1") {
 // The message/tool components are pi's own interactive-mode renderers — we
 // re-render them headless at the phone's width so the app shows *exactly*
 // what the terminal shows (markdown, syntax highlighting, diffs, theming).
-// Every name here is exported by upstream pi; keep it that way. A fork-only
-// import is a hard load failure for anyone running stock pi, not a graceful
+// Every name here is exported by pi's published packages; keep it that way.
+// An unexported name is a hard load failure for everyone, not a graceful
 // degradation — see the capability probe in `start()`.
 import {
   AssistantMessageComponent,
@@ -527,7 +527,7 @@ function refreshRemoteStatus(): void {
 
 // ── Screen mirror ────────────────────────────────────────────────────────
 // Ships the TUI's composed frames to subscribed clients (see attachMirror for
-// how frames are captured without any fork hook) and routes their keystrokes
+// how frames are captured) and routes their keystrokes
 // back through the TUI's input path. Categorical: any surface that renders in
 // the terminal renders on the phone, including overlays and widgets.
 
@@ -581,10 +581,10 @@ const MIRROR_CHEAP_RENDER_MS = 100;
 // local input, nobody is there and the mirror runs at full pump cadence.
 // This is the difference between ~2 fps and render-bound (~7–15 fps) while the
 // agent streams: streaming renders the desktop continuously, so the "desktop
-// quiet" test never passes and every frame used to wait out MAX_DEFER — hurting
+// quiet" test never passes and every frame would wait out MAX_DEFER — hurting
 // the phone hardest exactly when its user is watching. (Terminal query replies
 // — OSC color reports and the like — also pass through handleInput and stamp
-// presence spuriously; they're rare, and the cost is 10 s of the old behavior.)
+// presence spuriously; they're rare, and the cost is 10 s of deferral.)
 const MIRROR_LOCAL_PRESENCE_MS = 10_000;
 // Deflate mirror payloads (sent as binary WS frames) once they exceed this many
 // bytes — ANSI text compresses ~5-10x. The big win is the initial keyframe (full
@@ -806,9 +806,8 @@ function ensureMirrorPump(): void {
 
 // The TUI internals the mirror drives. `render` is public (Container.render);
 // the rest are `protected`/`private`, which TypeScript erases at compile time —
-// so they are reachable at runtime on a stock pi build with no patch. That is
-// what lets this extension ship to ordinary pi users. It is also the one thing
-// that can break on a pi upgrade with no type error and no test failure, so we
+// so they are reachable at runtime. That reach-in is also the one thing that
+// can break on a pi upgrade with no type error and no test failure, so we
 // check for them up front and say so loudly instead of mirroring a blank screen.
 const MIRROR_TUI_MEMBERS = [
   "doRender",             // patched to learn when the desktop rendered
@@ -823,8 +822,8 @@ function missingTuiMembers(tui: any): string[] {
   return MIRROR_TUI_MEMBERS.filter((m) => typeof tui?.[m] !== "function");
 }
 
-// Capture composed frames WITHOUT any fork hook: wrap the TUI's private
-// doRender (TS `private` is compile-time only, so it's reachable at runtime).
+// Capture composed frames by wrapping the TUI's private doRender
+// (TS `private` is compile-time only, so it's reachable at runtime).
 // The hot path stays cheap — it only marks the mirror dirty; the throttled pump
 // does the actual phone-width render off the desktop render path.
 function attachMirror(tui: any): void {
@@ -834,7 +833,7 @@ function attachMirror(tui: any): void {
   if (missing.length > 0) {
     console.warn(
       `[pi-remote-control] screen mirror disabled: this pi build's TUI is missing ${missing.join(", ")}.\n` +
-      `  The mirror drives pi's own renderer through internals that upstream may rename at any time.\n` +
+      `  The mirror drives pi's own renderer through internals that pi may rename at any time.\n` +
       `  Please report the pi version at https://github.com/kolt-mcb/pi-remote-control/issues — phones will connect but show nothing.`,
     );
     return; // leave mirrorTui null: no half-attached state, no pump
@@ -932,9 +931,8 @@ function injectMirrorInput(data: string): void {
 }
 
 // Run a line through pi's own editor submit path, as if the user typed it and
-// pressed Enter. setEditorText / getEditorText are upstream ExtensionUIContext
-// methods, and Enter goes through the same injection the mirror already uses
-// for phone keystrokes — so this works on stock pi with no patch.
+// pressed Enter: setEditorText, then Enter through the same injection the
+// mirror already uses for phone keystrokes.
 //
 // The editor may hold a half-typed draft. Setting the text outright (rather
 // than injecting the line character by character) avoids concatenating onto it,
@@ -1293,8 +1291,8 @@ function sendCurrentTheme(ws: WebSocket): void {
 // because the screen mirror ships whatever the terminal shows — while output
 // commands (/copy, /export, /share) run on the host machine.
 //
-// Injecting the keystrokes needs nothing upstream doesn't already have, and
-// exercises the exact path a human uses. See submitInputLine().
+// Injecting the keystrokes exercises the exact path a human uses. See
+// submitInputLine().
 //
 // /reload tears down and rebinds the extension runtime mid-call, so it stays
 // routed to a notice. /resume gets its own in-extension picker (see
@@ -1525,11 +1523,10 @@ function sendHistory(ws: WebSocket): void {
  * Catch stale-extension-runtime exceptions that would crash pi.
  * Sends a notify banner and returns false on error.
  *
- * `pi.withCommandContext` exists in current upstream pi, but older builds may
- * lack it. If it's missing, the remaining callers (the /model and /resume
- * pickers) can't run, so say so out loud rather than failing into a console
- * warning nobody reads. Everything else the app drives goes through
- * submitInputLine() instead.
+ * If this pi build lacks `pi.withCommandContext`, the callers that need it
+ * (the /model and /resume pickers) can't run, so say so out loud rather than
+ * failing into a console warning nobody reads. Everything else the app drives
+ * goes through submitInputLine() instead.
  */
 async function safeCtx(
   pi: ExtensionAPI,
@@ -1537,7 +1534,7 @@ async function safeCtx(
   fn: (ctx: any) => Promise<void> | void,
 ): Promise<boolean> {
   if (typeof (pi as any).withCommandContext !== "function") {
-    console.warn(`safeCtx[${label}]: this pi build has no withCommandContext (upstream build?)`);
+    console.warn(`safeCtx[${label}]: this pi build has no withCommandContext`);
     hostBcastClients(JSON.stringify({
       type: "extension_ui_request",
       method: "notify",
@@ -1588,8 +1585,8 @@ function emitAgentEvent(obj: Record<string, unknown>): void {
 // colors, backgrounds, and layout match — reflowed to the phone, not the desktop.
 //
 // Requires a pi build that exposes getMessageRenderer/getToolDefinition on the
-// extension API (current upstream does; older builds may not). Everything here
-// degrades to undefined → the app falls back to plain text.
+// extension API. Everything here degrades to undefined → the app falls back to
+// plain text.
 let clientCols = 60;                       // device width in columns; set by {type:"viewport"}
 let piApi: ExtensionAPI | null = null;     // captured in the default export for module-level use
 
@@ -1801,8 +1798,8 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
   const url = urlWithToken(`wss://${ip}:${DEFAULT_PORT}`);
 
   // TLS terminates here. The WebSocketServer hooks into the https server's
-  // 'upgrade' event for us; events that used to come from WebSocketServer
-  // (error / listening) now come from the underlying https server.
+  // 'upgrade' event for us; error / listening events come from the underlying
+  // https server.
   const httpsServer = https.createServer({ cert: TLS.cert, key: TLS.key });
   const server = new WebSocketServer({ server: httpsServer });
   RC.wss = server;
@@ -2455,8 +2452,8 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
     }
     // ── Remote slash-command execution ───────────────────────────────────
     // /resume opens the in-extension picker; /reload is a REMOTE_STALES notice.
-    // Everything else — /compact, /quit, /new included — is typed into pi's own
-    // editor by submitInputLine(), which needs only upstream APIs.
+    // Everything else — /compact, /quit, /new included — is typed into pi's
+    // own editor by submitInputLine().
     // Session-replacing commands like /new fire session_shutdown (which closes
     // client sockets) then rebind a fresh host; the phone auto-reconnects to the
     // new session.
@@ -2587,10 +2584,10 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
       hostBcastSessionList(ws);
       break;
     }
-    // `get_commands` (and the `command_list` reply) are retired. They fed a
-    // native command menu in the app, which the screen mirror replaced: typing
-    // "/" on the phone now shows pi's own menu in the frame. Old app builds may
-    // still send it; the default case ignores unknown types, so they're fine.
+    // There is no `get_commands`/`command_list` pair: typing "/" on the phone
+    // shows pi's own command menu in the mirrored frame, so a client never
+    // needs a command list. Unknown types land in the default case and are
+    // ignored.
     case "extension_ui_response": {
       const id = (cmd.id as string) || "";
       const cancelled = cmd.cancelled === true;
