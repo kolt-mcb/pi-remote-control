@@ -50,13 +50,14 @@ if (!selectListEvents) {
 if (!respondToSelectList) {
   respondToSelectList = () => {};
 }
-// BUILTIN_SLASH_COMMANDS used to match supported remote commands (/compact, /quit).
 // The message/tool components are pi's own interactive-mode renderers — we
 // re-render them headless at the phone's width so the app shows *exactly*
 // what the terminal shows (markdown, syntax highlighting, diffs, theming).
+// Every name here is exported by upstream pi; keep it that way. A fork-only
+// import is a hard load failure for anyone running stock pi, not a graceful
+// degradation — see the capability probe in `start()`.
 import {
   AssistantMessageComponent,
-  BUILTIN_SLASH_COMMANDS,
   SessionManager,
   ToolExecutionComponent,
   UserMessageComponent,
@@ -741,19 +742,48 @@ function ensureMirrorPump(): void {
   mirrorPump.unref?.();
 }
 
+// The TUI internals the mirror drives. `render` is public (Container.render);
+// the rest are `protected`/`private`, which TypeScript erases at compile time —
+// so they are reachable at runtime on a stock pi build with no patch. That is
+// what lets this extension ship to ordinary pi users. It is also the one thing
+// that can break on a pi upgrade with no type error and no test failure, so we
+// check for them up front and say so loudly instead of mirroring a blank screen.
+const MIRROR_TUI_MEMBERS = [
+  "doRender",             // patched to learn when the desktop rendered
+  "render",               // re-render the component tree at the phone's width
+  "compositeOverlays",    // fold open overlays into those lines
+  "extractCursorPosition",
+  "applyLineResets",
+  "handleInput",          // keys and taps back in
+] as const;
+
+function missingTuiMembers(tui: any): string[] {
+  return MIRROR_TUI_MEMBERS.filter((m) => typeof tui?.[m] !== "function");
+}
+
 // Capture composed frames WITHOUT any fork hook: wrap the TUI's private
 // doRender (TS `private` is compile-time only, so it's reachable at runtime).
 // The hot path stays cheap — it only marks the mirror dirty; the throttled pump
 // does the actual phone-width render off the desktop render path.
 function attachMirror(tui: any): void {
   if (!tui || mirrorTui === tui) return;
+
+  const missing = missingTuiMembers(tui);
+  if (missing.length > 0) {
+    console.warn(
+      `[pi-remote-control] screen mirror disabled: this pi build's TUI is missing ${missing.join(", ")}.\n` +
+      `  The mirror drives pi's own renderer through internals that upstream may rename at any time.\n` +
+      `  Please report the pi version at https://github.com/kolt-mcb/pi-remote-control/issues — phones will connect but show nothing.`,
+    );
+    return; // leave mirrorTui null: no half-attached state, no pump
+  }
+
   mirrorTui = tui;
   ensureMirrorPump();
   if (tui.__rcMirrorPatched) return;
   tui.__rcMirrorPatched = true;
 
-  const origDoRender = tui.doRender?.bind(tui);
-  if (typeof origDoRender !== "function") return; // unexpected build; mirror stays off
+  const origDoRender = tui.doRender.bind(tui);
 
   tui.doRender = () => {
     origDoRender(); // desktop render exactly as before — no extra work inline
@@ -824,6 +854,38 @@ function injectMirrorInput(data: string): void {
   // follow-up catches redraws that land asynchronously after handleInput.
   requestMirrorFrame();
   setTimeout(requestMirrorFrame, MIRROR_FRAME_MS);
+}
+
+// Run a line through pi's own editor submit path, as if the user typed it and
+// pressed Enter. Replaces the fork-only ctx.executeInputLine(): setEditorText /
+// getEditorText are upstream ExtensionUIContext methods, and Enter goes through
+// the same injection the mirror already uses for phone keystrokes — so this
+// works on stock pi with no patch.
+//
+// The editor may hold a half-typed draft. Setting the text outright (rather
+// than injecting the line character by character) avoids concatenating onto it,
+// and the draft is put back after submit — pi clears the editor on submit, so
+// restoring is safe and the user doesn't silently lose what they were writing.
+//
+// Returns false when there is no TUI to drive (peer loading, non-interactive
+// modes); callers surface that rather than failing silently.
+function submitInputLine(line: string): boolean {
+  if (!mirrorTui) return false;
+  const ui = selfUi as any;
+  let draft = "";
+  try { draft = ui?.getEditorText?.() ?? ""; } catch { /* optional */ }
+  try {
+    ui?.setEditorText?.(line);
+  } catch {
+    return false; // no editor to drive — don't inject a bare Enter
+  }
+  injectMirrorInput("\r");
+  if (draft) {
+    // After the submit has been processed, not inside it: restoring synchronously
+    // would race the editor's own post-submit clear and wipe the draft anyway.
+    setTimeout(() => { try { ui?.setEditorText?.(draft); } catch { /* ignore */ } }, 0);
+  }
+  return true;
 }
 
 function mirrorFramePayload(): Record<string, unknown> {
@@ -1139,27 +1201,20 @@ function sendCurrentTheme(ws: WebSocket): void {
 }
 
 // ── Remote slash-command support ────────────────────────────────────────
-// The phone can run any built-in slash command on the host via the command
-// context's executeInputLine() (added by our pi fork): it drives pi's editor
-// submit path, so selector commands (/model, /settings, /tree, …) open their
-// selectors — which surface on the phone through the SelectList bridge — while
-// output commands (/copy, /export, /share) run on the host machine.
+// The phone runs a built-in slash command by typing it: submitInputLine()
+// puts the line in pi's own editor and injects Enter, so selector commands
+// (/model, /settings, /tree, …) open their selectors — which the phone sees
+// because the screen mirror ships whatever the terminal shows — while output
+// commands (/copy, /export, /share) run on the host machine.
 //
-// /reload would tear down and rebind the extension runtime, which would
-// invalidate the command-context the call runs in, so route it to a notice
-// for now. /resume gets its own in-extension text render-frame picker (see
+// This used to go through ctx.executeInputLine(), an API our pi fork added.
+// Injecting the keystrokes needs nothing upstream doesn't already have, and
+// exercises the exact path a human uses. See submitInputLine().
+//
+// /reload tears down and rebinds the extension runtime mid-call, so it stays
+// routed to a notice. /resume gets its own in-extension picker (see
 // showResumePicker) and is intentionally NOT in this set.
 const REMOTE_STALES = new Set(["reload"]);
-
-// All built-ins are offered to the phone so the menu mirrors pi's own.
-function buildCommandList(): { name: string; description: string }[] {
-  return BUILTIN_SLASH_COMMANDS.map((b) => ({ name: b.name, description: b.description }));
-}
-
-function sendCommandList(ws: WebSocket): void {
-  if (ws.readyState !== 1) return;
-  ws.send(JSON.stringify({ type: "command_list", commands: buildCommandList() }));
-}
 
 // ── Conversation history replay ─────────────────────────────────────────────
 // On (re)connect the phone only sees events from that point forward — anything
@@ -1384,12 +1439,28 @@ function sendHistory(ws: WebSocket): void {
 /**
  * Catch stale-extension-runtime exceptions that would crash pi.
  * Sends a notify banner and returns false on error.
+ *
+ * `pi.withCommandContext` is NOT in upstream pi — it comes from our fork. On a
+ * stock build the remaining callers (the /model and /resume pickers) can't run,
+ * so say so out loud rather than failing into a console warning nobody reads.
+ * Everything the app actually drives goes through submitInputLine() instead.
  */
 async function safeCtx(
   pi: ExtensionAPI,
   label: string,
   fn: (ctx: any) => Promise<void> | void,
 ): Promise<boolean> {
+  if (typeof (pi as any).withCommandContext !== "function") {
+    console.warn(`safeCtx[${label}]: this pi build has no withCommandContext (upstream build?)`);
+    hostBcastClients(JSON.stringify({
+      type: "extension_ui_request",
+      method: "notify",
+      id: `notify_unsupported_${Date.now()}`,
+      message: `${label} isn't available on this pi build — type ${label} in the terminal, or on the phone's mirror.`,
+      notifyType: "warning",
+    }));
+    return false;
+  }
   try {
     await pi.withCommandContext(fn);
     return true;
@@ -1743,7 +1814,6 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
 
     hostBcastClients(JSON.stringify({ type: "connected", clients: clientConns.size }));
     hostBcastSessionList();
-    sendCommandList(ws);
     // Send the current Pi theme palette so the phone UI mirrors the terminal
     sendCurrentTheme(ws);
     // Replay the full conversation so a fresh connect (or reconnect) shows the
@@ -2040,8 +2110,8 @@ function showResumePicker(pi: ExtensionAPI): void {
     }
     const path = sessions[n - 1].path;
     dismiss();
-    // Defer like ctx.executeInputLine — switchSession tears down and rebinds
-    // the runtime, which would invalidate the command-context we're inside.
+    // Defer: switchSession tears down and rebinds the runtime, which would
+    // invalidate the command-context we're inside.
     // session_shutdown fires, the WS closes, the phone reconnects.
     setImmediate(() => {
       void safeCtx(pi, "/resume", async (ctx) => {
@@ -2069,28 +2139,20 @@ function showResumePicker(pi: ExtensionAPI): void {
 
 // Run a slash command against THIS pi's own session. Used both for commands
 // the phone targets at our self agent and for ones forwarded to us as a peer
-// (route_slash_command). /compact and /quit use dedicated context actions;
-// /resume opens the in-extension text render-frame picker (above); /reload is
-// routed to a notice; everything else (incl. /new) goes through pi's editor
-// submit path via ctx.executeInputLine.
+// (route_slash_command). /resume opens the in-extension picker (above);
+// /reload is routed to a notice; everything else — including /compact, /quit
+// and /new — goes through pi's own editor submit path by typing it.
 function executeSlashLocally(pi: ExtensionAPI, commandName: string, args: string): void {
   if (commandName === "compact") {
     const instructions = args.trim();
-    void (async () => {
-      const ok = await safeCtx(pi, "/compact", async (ctx) => {
-        ctx.compact(instructions ? { instructions } : undefined);
-      });
-      if (!ok) return;
-      hostBcastClients(JSON.stringify({
-        type: "extension_ui_request",
-        method: "notify",
-        id: `notify_compact_${Date.now()}`,
-        message: instructions ? `Compacting with custom instructions...` : `Compacting session context...`,
-        notifyType: "info",
-      }));
-    })();
-  } else if (commandName === "quit") {
-    void safeCtx(pi, "/quit", async (ctx) => { void ctx.shutdown(); });
+    if (!submitInputLine(instructions ? `/compact ${instructions}` : "/compact")) return;
+    hostBcastClients(JSON.stringify({
+      type: "extension_ui_request",
+      method: "notify",
+      id: `notify_compact_${Date.now()}`,
+      message: instructions ? `Compacting with custom instructions...` : `Compacting session context...`,
+      notifyType: "info",
+    }));
   } else if (commandName === "resume") {
     showResumePicker(pi);
   } else if (commandName === "model" && !args.trim()) {
@@ -2108,7 +2170,15 @@ function executeSlashLocally(pi: ExtensionAPI, commandName: string, args: string
   } else {
     const a = args.trim();
     const line = a ? `/${commandName} ${a}` : `/${commandName}`;
-    void safeCtx(pi, `/${commandName}`, async (ctx) => { await ctx.executeInputLine(line); });
+    if (!submitInputLine(line)) {
+      hostBcastClients(JSON.stringify({
+        type: "extension_ui_request",
+        method: "notify",
+        id: `notify_no_editor_${Date.now()}`,
+        message: `/${commandName} needs pi's interactive editor — it isn't available here.`,
+        notifyType: "warning",
+      }));
+    }
   }
 }
 
@@ -2284,12 +2354,12 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
       break;
     }
     // ── Remote slash-command execution ───────────────────────────────────
-    // /compact and /quit use dedicated context actions (nice phone feedback).
-    // /resume, /reload are REMOTE_STALES — routed to notices for now.
-    // Everything else (including /new) runs on the host via ctx.executeInputLine().
+    // /resume opens the in-extension picker; /reload is a REMOTE_STALES notice.
+    // Everything else — /compact, /quit, /new included — is typed into pi's own
+    // editor by submitInputLine(), which needs nothing our fork added.
     // Session-replacing commands like /new fire session_shutdown (which closes
     // client sockets) then rebind a fresh host; the phone auto-reconnects to the
-    // new session. safeCtx wraps pi.withCommandContext to catch stale crashes.
+    // new session.
     case "slash_command": {
       const commandName = (cmd.command as string)?.trim().toLowerCase();
       if (!commandName) break;
@@ -2417,10 +2487,10 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
       hostBcastSessionList(ws);
       break;
     }
-    case "get_commands": {
-      sendCommandList(ws);
-      break;
-    }
+    // `get_commands` (and the `command_list` reply) are retired. They fed a
+    // native command menu in the app, which the screen mirror replaced: typing
+    // "/" on the phone now shows pi's own menu in the frame. Old app builds may
+    // still send it; the default case ignores unknown types, so they're fine.
     case "extension_ui_response": {
       const id = (cmd.id as string) || "";
       const cancelled = cmd.cancelled === true;
