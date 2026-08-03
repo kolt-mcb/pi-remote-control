@@ -1,21 +1,25 @@
 /**
  * Pi Remote Control Extension
  *
- * Starts a WebSocket server inside pi so you can connect from your phone.
- * No separate server process needed.
+ * Drives a pi session from a phone. Starts a TLS WebSocket server inside pi
+ * (no separate process), prints a QR code carrying the URL + auth token +
+ * cert fingerprint, and mirrors the live TUI to any connected client:
+ * frames are re-rendered at the client's column width, row-diffed, deflated,
+ * and streamed; client keystrokes are injected back through pi's own input
+ * path. Runs on stock upstream pi — no patches required.
  *
- * If port is already in use by another pi on this host, switches to peer
- * mode: connects to the running pi as a client and registers itself as an
- * additional agent session. The Android app can then route prompts to
- * either pi via the SessionSelector.
+ * Also provides: multi-session support (a second pi on the same host joins as
+ * a peer over the same port, and clients can view/drive either), conversation
+ * history replay on connect, file delivery to the client
+ * (send_file_to_phone), and inline image display (show_image_to_phone).
  *
- * Usage:
- *   pi -e ~/pi-remote-control/extension.ts
+ * Slash commands:
+ *   /remote-control   — start the WS server (or peer mode if the port is busy)
+ *   /remote-qr        — show the pairing QR code (works anytime)
+ *   /remote-stop      — stop
  *
- * Then in pi:
- *   /remote-control   — starts the WS server (or peer mode if port busy)
- *   /remote-qr        — display the QR code for the phone app (works anytime)
- *   /remote-stop      — stops it
+ * The server autostarts on session_start; set PI_REMOTE_CONTROL_NO_AUTOSTART=1
+ * to opt out. See README.md for the full env-var and protocol reference.
  */
 
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
@@ -38,26 +42,6 @@ import selfsigned from "selfsigned";
 // it silently talks to a copy nothing else is using. Measured, not theorised:
 // patching the require()d Markdown/Text produced zero cache hits.
 import { getCapabilities, Markdown, setCapabilities, Text as TuiText } from "@earendil-works/pi-tui";
-// Local fork of pi-tui exposes selectListEvents/respondToSelectList so we can
-// surface any SelectList-based selector (built-in or extension) to the phone.
-// These are NOT in upstream pi; provide no-op stubs so the extension loads everywhere.
-let selectListEvents: {
-  on(event: "mount" | "dismiss", handler: (...args: any[]) => void): void;
-} | null = null;
-let respondToSelectList: ((id: string, value: any) => void) | null = null;
-try {
-  // @ts-ignore — only available in a local fork of pi-tui
-  const tui = require("@earendil-works/pi-tui");
-  if (tui.selectListEvents) selectListEvents = tui.selectListEvents;
-  if (tui.respondToSelectList) respondToSelectList = tui.respondToSelectList;
-} catch {}
-if (!selectListEvents) {
-  // No-op emitter — the mount/dismiss listeners below become no-ops
-  selectListEvents = { on: () => {} };
-}
-if (!respondToSelectList) {
-  respondToSelectList = () => {};
-}
 
 // ── Optional: width-keyed render cache (PI_REMOTE_WIDTH_CACHE=1) ─────────
 // pi-tui's Text and Markdown each cache their rendered lines in ONE slot, keyed
@@ -421,29 +405,6 @@ let peerReconnectTimer: NodeJS.Timeout | null = null;
 // Collects callbacks registered via onInput()
 const inputListeners: Array<(id: string, value: string) => void> = [];
 
-// Bridge pi-tui SelectList lifecycle to the phone. Any selector that uses
-// SelectList under the hood (themes, thinking levels, settings, show-images,
-// plus anything an extension builds with it) shows up as a native dialog on
-// the phone via the existing extension_ui_request protocol.
-// Map labels back to values when the phone sends a string response.
-const liveSelectListLabels = new Map<string, Map<string, string>>();
-selectListEvents.on("mount", (e: { id: string; items: Array<{ value: string; label: string; description?: string }> }) => {
-  const labelToValue = new Map<string, string>();
-  for (const it of e.items) labelToValue.set(it.label || it.value, it.value);
-  liveSelectListLabels.set(e.id, labelToValue);
-  hostBcastClients(JSON.stringify({
-    type: "extension_ui_request",
-    method: "select",
-    id: e.id,
-    title: "Select",
-    options: e.items.map((it) => it.label || it.value),
-  }));
-});
-selectListEvents.on("dismiss", (e: { id: string }) => {
-  liveSelectListLabels.delete(e.id);
-  hostBcastClients(JSON.stringify({ type: "extension_ui_dismiss", id: e.id }));
-});
-
 // Phone-native /model picker. pi's /model opens ModelSelectorComponent — a
 // custom fuzzy-search Container, NOT a SelectList — so the SelectList bridge
 // never sees it and the phone gets nothing. Enumerate the registry directly
@@ -565,10 +526,10 @@ function refreshRemoteStatus(): void {
 }
 
 // ── Screen mirror ────────────────────────────────────────────────────────
-// Ships the TUI's composed frames (fork hook: tui.onFrame) to subscribed
-// clients and routes their keys/taps back via tui.injectInput. Categorical:
-// any surface that renders in the terminal renders on the phone, including
-// overlays, widgets, and SGR mouse clickables. Host pi only (v1).
+// Ships the TUI's composed frames to subscribed clients (see attachMirror for
+// how frames are captured without any fork hook) and routes their keystrokes
+// back through the TUI's input path. Categorical: any surface that renders in
+// the terminal renders on the phone, including overlays and widgets.
 
 // Mirror frame cadence (~15fps). The phone-width render is the expensive part
 // (it thrashes pi's width-keyed markdown cache, forcing the desktop to
@@ -767,31 +728,19 @@ function renderMirrorNow(): boolean {
       } catch { saved = undefined; }
     }
     let lines: string[];
-    let dbgRaw = 0, dbgOverlay = 0;
     try {
       lines = tui.render(width);
-      dbgRaw = lines.length;
       if (tui.overlayStack?.length > 0) lines = tui.compositeOverlays(lines, width, height);
-      dbgOverlay = lines.length;
     } finally {
       if (saved !== undefined) {
         try { setCapabilities(saved); } catch { /* ignore */ }
       }
     }
     const cursor = tui.extractCursorPosition(lines, height);
-    const dbgAfterCursor = lines.length;
     lines = tui.applyLineResets(lines);
-    const dbgAfterResets = lines.length;
     // Swap any "[Image: ...]" text placeholder for the real image escape so the
     // phone shows show_image_to_phone images inline (the host terminal can't).
     lines = substituteInlineImages(lines);
-    if (MIRROR_DEBUG) {
-      try {
-        require("fs").appendFileSync("/tmp/mirror_dbg.log",
-          `final=${lines.length} raw=${dbgRaw} overlay=${dbgOverlay} afterCursor=${dbgAfterCursor} afterResets=${dbgAfterResets}` +
-          ` width=${width} clientCols=${clientCols} termCols=${termCols} overlays=${tui.overlayStack?.length ?? 0} forceImages=${forceImages} scrollSlice=${(tui as any)?.scrollSliceStart ?? -1}\n`);
-      } catch { /* ignore */ }
-    }
     mirrorSeq++;
     lastMirrorFrame = { lines, cursor, width, height };
     lastMirrorRenderMs = Date.now() - renderT0;
@@ -983,10 +932,9 @@ function injectMirrorInput(data: string): void {
 }
 
 // Run a line through pi's own editor submit path, as if the user typed it and
-// pressed Enter. Replaces the fork-only ctx.executeInputLine(): setEditorText /
-// getEditorText are upstream ExtensionUIContext methods, and Enter goes through
-// the same injection the mirror already uses for phone keystrokes — so this
-// works on stock pi with no patch.
+// pressed Enter. setEditorText / getEditorText are upstream ExtensionUIContext
+// methods, and Enter goes through the same injection the mirror already uses
+// for phone keystrokes — so this works on stock pi with no patch.
 //
 // The editor may hold a half-typed draft. Setting the text outright (rather
 // than injecting the line character by character) avoids concatenating onto it,
@@ -1345,7 +1293,6 @@ function sendCurrentTheme(ws: WebSocket): void {
 // because the screen mirror ships whatever the terminal shows — while output
 // commands (/copy, /export, /share) run on the host machine.
 //
-// This used to go through ctx.executeInputLine(), an API our pi fork added.
 // Injecting the keystrokes needs nothing upstream doesn't already have, and
 // exercises the exact path a human uses. See submitInputLine().
 //
@@ -1578,10 +1525,11 @@ function sendHistory(ws: WebSocket): void {
  * Catch stale-extension-runtime exceptions that would crash pi.
  * Sends a notify banner and returns false on error.
  *
- * `pi.withCommandContext` is NOT in upstream pi — it comes from our fork. On a
- * stock build the remaining callers (the /model and /resume pickers) can't run,
- * so say so out loud rather than failing into a console warning nobody reads.
- * Everything the app actually drives goes through submitInputLine() instead.
+ * `pi.withCommandContext` exists in current upstream pi, but older builds may
+ * lack it. If it's missing, the remaining callers (the /model and /resume
+ * pickers) can't run, so say so out loud rather than failing into a console
+ * warning nobody reads. Everything else the app drives goes through
+ * submitInputLine() instead.
  */
 async function safeCtx(
   pi: ExtensionAPI,
@@ -1639,9 +1587,9 @@ function emitAgentEvent(obj: Record<string, unknown>): void {
 // device's column width and ship those lines. The app renders them verbatim, so
 // colors, backgrounds, and layout match — reflowed to the phone, not the desktop.
 //
-// Requires the patched pi build that exposes getMessageRenderer/getToolDefinition
-// on the extension API (they exist on the runner; stock builds don't forward
-// them). Everything here degrades to undefined → the app falls back to plain text.
+// Requires a pi build that exposes getMessageRenderer/getToolDefinition on the
+// extension API (current upstream does; older builds may not). Everything here
+// degrades to undefined → the app falls back to plain text.
 let clientCols = 60;                       // device width in columns; set by {type:"viewport"}
 let piApi: ExtensionAPI | null = null;     // captured in the default export for module-level use
 
@@ -1844,15 +1792,6 @@ function withImageLines(
   if (lines.length === 0) return { stream, overflow };
   const joined = lines.join("\n");
   return { stream: stream ? `${stream}\n${joined}` : joined, overflow };
-}
-
-function parseNameFromUrl(reqUrl: string | undefined, fallback: string): string {
-  if (!reqUrl) return fallback;
-  try {
-    return new URL(reqUrl, "ws://x").searchParams.get("name") || fallback;
-  } catch {
-    return fallback;
-  }
 }
 
 // ── Server (host) lifecycle ─────────────────────────────────────────────
@@ -2517,7 +2456,7 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
     // ── Remote slash-command execution ───────────────────────────────────
     // /resume opens the in-extension picker; /reload is a REMOTE_STALES notice.
     // Everything else — /compact, /quit, /new included — is typed into pi's own
-    // editor by submitInputLine(), which needs nothing our fork added.
+    // editor by submitInputLine(), which needs only upstream APIs.
     // Session-replacing commands like /new fire session_shutdown (which closes
     // client sockets) then rebind a fresh host; the phone auto-reconnects to the
     // new session.
@@ -2656,17 +2595,7 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
       const id = (cmd.id as string) || "";
       const cancelled = cmd.cancelled === true;
       const label = (cmd.value as string) ?? "";
-      if (id.startsWith("sl_")) {
-        // SelectList bridge: forward to pi-tui's responder so the live local
-        // TUI selector also dismisses.
-        if (cancelled) {
-          respondToSelectList(id, null);
-        } else {
-          // We sent labels to the phone; translate back to the SelectItem value.
-          const value = liveSelectListLabels.get(id)?.get(label) ?? label;
-          respondToSelectList(id, value);
-        }
-      } else if (id.startsWith("modelpick_")) {
+      if (id.startsWith("modelpick_")) {
         const byLabel = pendingModelPicks.get(id);
         pendingModelPicks.delete(id);
         const model = !cancelled ? byLabel?.get(label) : undefined;

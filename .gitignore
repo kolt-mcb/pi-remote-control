@@ -4,6 +4,9 @@ node_modules/
 # Claude / AI tooling
 .claude/
 
+# Local scratch notes (not part of the published repo)
+.notes/
+
 # OS
 .DS_Store
 Thumbs.db

@@ -1,10 +1,18 @@
 # pi-remote-control
 
-A [pi](https://github.com/badlogic/pi-mono) extension that exposes a live pi
-session over a LAN WebSocket so a remote client can drive it. The reference
-client is the Android app at
+A [pi](https://github.com/earendil-works/pi) extension that mirrors your live
+pi session to your phone and lets you drive it from there. The extension
+starts a TLS WebSocket server inside pi (no separate process), prints a QR
+code, and streams the actual terminal UI — everything that renders in your
+terminal renders on the phone, re-wrapped to the phone's width. Keystrokes
+from the phone go back through pi's own input path, so menus, pickers, and
+slash commands all just work.
+
+The reference client is the Android app at
 [`kolt-mcb/pi-remote-control-app`](https://github.com/kolt-mcb/pi-remote-control-app);
 the protocol is plain WS + JSON, so anything that can speak it works.
+
+Runs on **stock upstream pi** — no fork, no patches.
 
 LAN-only by design — no cloud relay, no telemetry, no third-party SDKs. The
 phone (or other client) talks directly to your pi over `wss://` with a
@@ -16,6 +24,27 @@ the QR, and a [shared-secret token](#auth) gates every connection on top.
 | **Status** | Early. Solo-author project. APIs and storage formats may change between commits. |
 | **License** | MIT — see [LICENSE](LICENSE). |
 | **Privacy** | No analytics, no remote logging, no SDK callbacks. Network traffic is exactly: the pi WS server the client connects to, end-to-end TLS-encrypted with a pinned self-signed cert. |
+
+## Features
+
+- **Full-screen TTY mirror** — the phone shows pi's real TUI, rendered
+  server-side at the phone's column width. Frames are row-diffed and
+  deflate-compressed, so steady-state traffic is ~1 KB/s and the mirror stays
+  responsive over slow links (tested at 30 KB/s).
+- **Type from the phone** — a terminal keyboard on the client injects
+  keystrokes into pi's input path. Slash commands open pi's own menus in the
+  mirror.
+- **Multi-session** — start a second pi on the same machine and it joins the
+  first as a peer over the same port; connected clients can view and drive
+  every session and spawn new ones in a chosen directory.
+- **History replay** — on connect the client receives the whole conversation
+  so far, not just events from that point on.
+- **File and image delivery** — two agent tools are registered:
+  `send_file_to_phone` pushes a file to connected clients, and
+  `show_image_to_phone` displays an image inline in the mirror (the phone can
+  render images even when the host terminal can't).
+- **Theme mirroring** — the client is told pi's active theme palette so
+  colors match.
 
 ## Install
 
@@ -40,7 +69,8 @@ server starts on `session_start` and prints its URL + a QR code:
 [ ... QR code ... ]
 ```
 
-You can also re-display the QR code anytime with `/remote-qr`.
+You can also re-display the QR code anytime with `/remote-qr`, and stop the
+server with `/remote-stop`.
 
 Update later:
 ```bash
@@ -59,6 +89,19 @@ instructions live in the
 repo. The connect screen also lets you paste the WS URL manually if you can
 read it off the host.
 
+## Configuration
+
+All configuration is via environment variables on the host:
+
+| variable | default | effect |
+|---|---|---|
+| `PI_REMOTE_PORT` | `8765` | Port the WS server listens on. A second pi finding the port busy joins as a peer instead. |
+| `PI_REMOTE_TOKEN` | — | Provide your own auth token (e.g. from a password manager). Wins over the persisted file. |
+| `PI_REMOTE_CONTROL_NO_AUTH` | — | `1` disables token auth entirely. **Only safe on networks you fully trust.** The startup banner prints a loud warning. |
+| `PI_REMOTE_CONTROL_NO_AUTOSTART` | — | `1` stops the server from starting on `session_start`; run `/remote-control` manually instead. |
+| `PI_REMOTE_WIDTH_CACHE` | — | `1` enables a width-keyed render cache patch on pi-tui's Text/Markdown components. The mirror renders every frame a second time at the phone's width; without the cache the two widths evict each other's single cache slot on every alternation. Measured ~2× on render cost for long sessions. See [FRAMERATE-ANALYSIS.md](FRAMERATE-ANALYSIS.md). |
+| `PI_REMOTE_DEBUG` | — | `1` prints per-second mirror render/throughput counters. |
+
 ## Auth
 
 The WS server requires a shared-secret token. On first launch, the extension
@@ -72,13 +115,6 @@ The token is included in the printed URL/QR alongside the cert fingerprint
 wss://your-host:8765/?token=<32 hex chars>&fp=<64 hex chars sha256>
 ```
 Connections without a matching `?token=…` are closed with WS code `4001`.
-
-**Overrides**:
-- `PI_REMOTE_TOKEN=<your-token> pi` — provide your own (e.g., from a
-  password manager). Wins over the persisted file.
-- `PI_REMOTE_CONTROL_NO_AUTH=1 pi` — disable auth entirely. **Only safe on
-  networks you fully trust** (single-user laptop on home LAN with no port
-  forwarding, etc.). The startup banner prints a loud warning when set.
 
 To rotate the token: delete `~/.pi/agent/pi-remote-control.token` and
 restart pi. A fresh one will be generated and previous QRs/URLs become
@@ -109,6 +145,8 @@ invalid.
   apply inside the tunnel.
 - The extension is the only attack surface on the host side. There's no
   daemon outside pi's process; killing pi takes the server down.
+- Remember that anyone holding the QR (token + fingerprint) can drive your
+  coding agent, which can run shell commands. Treat the QR like a password.
 
 ## Build from source
 
@@ -123,33 +161,37 @@ pi -e ./extension.ts
 
 ## Protocol
 
-If you want to write your own client, the WS messages are documented in
-`extension.ts` — search for `emitAgentEvent` (host→client) and `handleHostCmd`
-(client→host). It's plain JSON. Key shapes:
+Plain JSON over WS; frames larger than 512 B are sent zlib-deflated as binary
+messages when the client opts in. If you want to write your own client, the
+authoritative reference is `extension.ts` — search for `handleHostCmd`
+(client→host) and the `send`/`bcast` helpers (host→client). Key shapes:
 
 | client → host | meaning |
 |---|---|
-| `{type:"prompt", message, images?, targetAgentId?}` | send a user message |
-| `{type:"steer", message, ...}` | interrupt current turn with a steer |
-| `{type:"follow_up", message, ...}` | queue a follow-up for next turn |
+| `{type:"client_hello", mirrorOnly?, diff?, deflate?, mirrorImages?}` | capability handshake; send first |
+| `{type:"mirror", on, agentId?}` | subscribe/unsubscribe to the screen mirror (optionally of a peer session) |
+| `{type:"mirror_input", data, agentId?}` | inject raw keystrokes into the mirrored session |
+| `{type:"viewport", cols}` | tell the host the client's column width; mirror frames re-render to fit |
+| `{type:"prompt" / "steer" / "follow_up", message, images?, targetAgentId?}` | send a user message / interrupt / queued follow-up |
 | `{type:"slash_command", command, args?, targetAgentId?}` | run a `/command` |
-| `{type:"spawn_peer", sessionPath?}` | spawn a new pi as peer (optionally resuming a saved session) |
-| `{type:"get_saved_sessions"}` | request the saved-session list |
-| `{type:"get_sessions"}` | request the connected-agent list |
-| `{type:"get_commands"}` | request the slash-command list |
-| `{type:"input", id, value}` | answer a render-frame menu (see `piRemote.render`) |
+| `{type:"spawn_peer", sessionPath?, cwd?}` | spawn a new pi as a peer session (optionally resuming a saved session) |
+| `{type:"get_sessions"}` / `{type:"get_saved_sessions"}` | request the connected-agent / saved-session lists |
+| `{type:"list_host_dirs", path?}` | browse host directories (for the spawn-peer folder picker) |
+| `{type:"input", id, value}` / `{type:"extension_ui_response", id, value?, cancelled?}` | answer a render-frame menu or dialog |
 
 | host → client | meaning |
 |---|---|
-| `{type:"agent_start" / "agent_end" / "turn_start" / "turn_end", agentId}` | turn lifecycle |
-| `{type:"message_start" / "message_end" / "message_update", agentId, ...}` | per-message streaming events |
-| `{type:"tool_start" / "tool_update" / "tool_end", agentId, ...}` | tool-call streaming events |
-| `{type:"session_list", sessions:[...]}` | connected agents |
-| `{type:"saved_sessions", sessions:[...]}` | response to `get_saved_sessions` |
-| `{type:"command_list", commands:[...]}` | response to `get_commands` |
-| `{type:"render", id, lines, inputMode, tapValues?, title?, dismiss?}` | ANSI render frame for a TUI component or in-extension menu |
-| `{type:"extension_ui_request", method, id, ...}` | dialogs/notifications driven by an extension's `pi.ui` API |
-| `{type:"theme_info", theme}` | the active pi theme palette so the client can mirror colors |
+| `{type:"connected", agentId, ...}` | handshake result; identifies the host session |
+| `{type:"mirror_frame", agentId, seq, lines, cursor, width, height}` | full mirror keyframe (ANSI lines) |
+| `{type:"mirror_diff", agentId, seq, lineCount, rows:[{i,t}], cursor}` | row-level diff against the previous frame |
+| `{type:"history", messages}` | conversation replay on connect |
+| `{type:"agent_start"/"agent_end"/"turn_start"/"turn_end", agentId}` | turn lifecycle |
+| `{type:"message_*" / "tool_*", agentId, ...}` | per-message / per-tool streaming events |
+| `{type:"session_list"}` / `{type:"saved_sessions"}` | session inventories |
+| `{type:"file", name, mimeType, data, agentId?}` | file pushed by `send_file_to_phone` (agentId set when it came from a peer session) |
+| `{type:"render", id, lines, inputMode, ...}` | ANSI render frame for an in-extension menu |
+| `{type:"extension_ui_request", method, id, ...}` | dialogs/notifications (`select`, `notify`, …) |
+| `{type:"theme_info", theme}` | pi's active theme palette |
 
 ## Contributing
 
@@ -159,8 +201,6 @@ changes by a few days.
 
 ## Acknowledgements
 
-- [pi-coding-agent](https://github.com/badlogic/pi-mono) by Mario Zechner —
-  the CLI agent this extension hooks into.
-- [pi-tui](https://github.com/badlogic/pi-mono/tree/main/packages/tui) —
-  the TUI framework whose `SelectList` lifecycle hooks make the phone-side
-  selector mirroring possible.
+- [pi](https://github.com/earendil-works/pi) by Mario Zechner — the CLI
+  coding agent this extension hooks into, whose extension API makes all of
+  this possible without patching.

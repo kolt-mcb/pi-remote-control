@@ -1,11 +1,9 @@
 # Mirror framerate — measured analysis and fix plan
 
-> **STATUS (2026-08-03): P1–P3 implemented and A/B-verified** (commit on
-> `stock-pi-compat`). Every number in the table below was re-measured on a
-> fixed harness that asserts which build owns the port before measuring — an
-> earlier harness bug let stale hosts survive between runs, which had produced
-> a contaminated "old" echo p95 (365 ms) and slow-link fps (3.69); the
-> corrected baseline numbers are in the A/B table at the end.
+> **STATUS (2026-08-03): P1–P3 implemented and A/B-verified.** Every number in
+> the table below was re-measured on a fixed harness that asserts which build
+> owns the port before measuring (an earlier harness bug let stale hosts
+> survive between runs and contaminated the first baseline).
 >
 > | verified A/B (2.2 MB session, 45 cols) | old | new (P1–P3) |
 > |---|---|---|
@@ -86,39 +84,37 @@ application-level ack can see the true in-flight depth.
 Not measured: phone-side decode/render cost (no device profiling in this pass).
 The app renders only the latest frame, so host fps is the ceiling either way.
 
-## Fix plan
+## Fixes
 
-**P1 — presence-aware deferral (host-only, the framerate fix).**
-Stamp `lastLocalInputAt` on any TUI input that did *not* come from
-`injectMirrorInput` (wrap `handleInput` in `attachMirror`; set a flag during
-injection). If no local input for ~10 s, nobody is at the desk: skip the
-quiet/defer test entirely and run at pump cadence. Expected: 1.9 → ~7 fps on
-the 2.2 MB session with WC=1 (render-bound), ~15 fps on typical sessions.
-The desktop keeps today's exact protection whenever someone is actually typing
+**P1 — presence-aware deferral (implemented; the framerate fix).**
+`lastLocalInputAt` is stamped on any TUI input that did *not* come from
+`injectMirrorInput` (`handleInput` is wrapped in `attachMirror`, with a flag
+set during injection). If there's been no local input for ~10 s, nobody is at
+the desk: the quiet/defer test is skipped entirely and the mirror runs at pump
+cadence. Verified: 1.69 → 6.38 fps on the 2.2 MB session with the width cache
+on. The desktop keeps the old protection whenever someone is actually typing
 or scrolling there — including the scrolled-back hard skip, unchanged.
 
-**P2 — fix the bypass threshold (host-only, one constant).**
-`MIRROR_CHEAP_RENDER_MS` 40 → 100 (or `MIRROR_MAX_DEFER_MS / 5`). With P1 this
-matters only while someone *is* at the desk and the phone types anyway; it
-flattens the echo tail (p95 → ≈ p50 + one render).
+**P2 — bypass threshold (implemented, one constant).**
+`MIRROR_CHEAP_RENDER_MS` 40 → 100. With P1 this matters only while someone
+*is* at the desk and the phone types anyway; it flattens the echo tail
+(p95 → ≈ p50 + one render). The A/B showed no idle-typing change, as expected.
 
-**P3 — give peer tabs the self-path machinery (host-only).**
-At the relay, keep per-(client, agent) last-sent lines and reuse the existing
-diff/backpressure/cadence path instead of blind `sendMirrorPayload`. The app
-already handles `mirror_diff` (verify its diff state is keyed per agentId — if
-not, that's a small app fix). Turns 46 KB/s per peer tab into the same ~1 KB/s
-the self tab costs, and stops the unbounded queue.
+**P3 — peer tabs get the self-path machinery (implemented).**
+The relay keeps per-(client, agent) last-sent lines and reuses the existing
+diff/backpressure/cadence path instead of forwarding every peer frame as a
+full keyframe. The app keys its diff state per agentId already, so no app
+change was needed. Verified: 22.5 s of peer streaming went from 2,437 KB
+(104 keyframes) to 37 KB (103 diffs) — 66× less wire, and no unbounded queue.
 
-**P4 — ack-based flow control (host + app, protocol addition).**
+**P4 — ack-based flow control (open; host + app, protocol addition).**
 App echoes `{type:"mirror_ack", seq}`; host keeps at most ~2 unacked frames per
 client, dropping intermediate frames (the app only shows the newest anyway).
 Backward-compatible: no acks seen → today's behavior. This is the only real
-answer to finding 6 on high-RTT links; do it after P1–P3, which may already be
-good enough in practice.
+answer to finding 6 on high-RTT links; P1–P3 may already be good enough in
+practice.
 
-**P5 — upstream the width cache** (`~/pi-fork` branch `feat/tui-width-cache`,
-measured 2× on renders). Independent of the above; the deferral fix is what
-converts it into visible fps.
-
-Rough sizing: P1+P2 ≈ 30 lines in extension.ts; P3 ≈ 60; P4 ≈ 40 host + app
-change. P1 is where the user-visible improvement lives.
+**P5 — upstream the width cache (open).** A 2-slot width-keyed LRU in
+pi-tui's Text/Markdown render cache (measured 2× on renders) would remove the
+need for the runtime patch behind `PI_REMOTE_WIDTH_CACHE=1`. Independent of
+the above; the deferral fix is what converts it into visible fps.
