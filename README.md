@@ -14,6 +14,11 @@ the protocol is plain WS + JSON, so anything that can speak it works.
 
 Runs on **stock upstream pi** — no fork, no patches.
 
+<p align="center">
+  <img src="docs/mirror-demo.gif" width="360"
+       alt="A live pi session mirrored on a phone: streaming agent output, session tabs, terminal keyboard">
+</p>
+
 LAN-only by design — no cloud relay, no telemetry, no third-party SDKs. The
 phone (or other client) talks directly to your pi over `wss://` with a
 self-signed cert that's [pinned by SHA-256 fingerprint](#security-notes) in
@@ -99,7 +104,7 @@ All configuration is via environment variables on the host:
 | `PI_REMOTE_TOKEN` | — | Provide your own auth token (e.g. from a password manager). Wins over the persisted file. |
 | `PI_REMOTE_CONTROL_NO_AUTH` | — | `1` disables token auth entirely. **Only safe on networks you fully trust.** The startup banner prints a loud warning. |
 | `PI_REMOTE_CONTROL_NO_AUTOSTART` | — | `1` stops the server from starting on `session_start`; run `/remote-control` manually instead. |
-| `PI_REMOTE_WIDTH_CACHE` | — | `1` enables a width-keyed render cache patch on pi-tui's Text/Markdown components. The mirror renders every frame a second time at the phone's width; without the cache the two widths evict each other's single cache slot on every alternation. Measured ~2× on render cost for long sessions. See [FRAMERATE-ANALYSIS.md](FRAMERATE-ANALYSIS.md). |
+| `PI_REMOTE_WIDTH_CACHE` | — | `1` enables a width-keyed render cache patch on pi-tui's Text/Markdown components. The mirror renders every frame a second time at the phone's width; without the cache the two widths evict each other's single cache slot on every alternation. Measured ~2× on render cost for long sessions. |
 | `PI_REMOTE_DEBUG` | — | `1` prints per-second mirror render/throughput counters. |
 
 ## Auth
