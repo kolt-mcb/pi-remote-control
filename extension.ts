@@ -607,7 +607,24 @@ const MIRROR_MAX_DEFER_MS = 500;
 // very thing MAX_DEFER guards). So: snappy typing on normal sessions, graceful fallback
 // to batching on pathological ones.
 const MIRROR_INPUT_ACTIVE_MS = 400;   // treat the phone as "typing" for this long after input
-const MIRROR_CHEAP_RENDER_MS = 40;    // only bypass the defer when renders are at/below this
+// Bypass ceiling for the typing fast-path. Measured render costs on a large
+// (2.2 MB) session are 59–85 ms cached and 108–124 ms uncached — the old value
+// of 40 sat BELOW the cached range, so the bypass engaged only on small
+// sessions, exactly where it wasn't needed (echo p95 hit 365 ms while p50 was
+// ~130). 100 keeps the original intent (don't let pathological renders fight
+// the event loop at pump cadence) while actually engaging on real sessions.
+const MIRROR_CHEAP_RENDER_MS = 100;
+// The desktop-protection deferral below only makes sense while a human is AT
+// the desktop. Local terminal input (keys, wheel — anything that reached the
+// TUI without coming from the phone) proves presence; after this long with no
+// local input, nobody is there and the mirror runs at full pump cadence.
+// This is the difference between ~2 fps and render-bound (~7–15 fps) while the
+// agent streams: streaming renders the desktop continuously, so the "desktop
+// quiet" test never passes and every frame used to wait out MAX_DEFER — hurting
+// the phone hardest exactly when its user is watching. (Terminal query replies
+// — OSC color reports and the like — also pass through handleInput and stamp
+// presence spuriously; they're rare, and the cost is 10 s of the old behavior.)
+const MIRROR_LOCAL_PRESENCE_MS = 10_000;
 // Deflate mirror payloads (sent as binary WS frames) once they exceed this many
 // bytes — ANSI text compresses ~5-10x. The big win is the initial keyframe (full
 // buffer) and full peer frames; tiny diffs stay as uncompressed text (not worth
@@ -627,6 +644,8 @@ let mirrorPump: NodeJS.Timeout | null = null;
 let lastDesktopRenderAt = 0;        // stamp of the most recent desktop doRender
 let lastMirrorSentAt = 0;           // stamp of the most recent phone frame sent
 let lastMirrorInputAt = 0;          // stamp of the most recent remote (phone) input
+let lastLocalInputAt = 0;           // stamp of the most recent LOCAL terminal input (human at desk)
+let injectingInput = false;         // true while injectMirrorInput drives handleInput, so its events don't count as local
 let lastMirrorRenderMs = 0;         // duration of the most recent renderMirrorNow()
 // Debug throughput accounting (1s window), only used when MIRROR_DEBUG.
 let mirrorDbgBytes = 0, mirrorDbgFrames = 0, mirrorDbgDropped = 0, mirrorDbgAt = 0;
@@ -686,8 +705,12 @@ function pendingHistory(): Map<WebSocket, NodeJS.Timeout> {
 // Last mirror frame actually SENT to each client, for row-level diffing. Stored
 // per-client (not globally) because the backpressure gate drops frames for slow
 // clients independently, so each client's diff base is whatever it last received.
-function mirrorClientState(): Map<WebSocket, { lines: string[]; width: number; height: number; lastSentAt: number }> {
-  return ((RC as any).mirrorClientState ??= new Map<WebSocket, { lines: string[]; width: number; height: number; lastSentAt: number }>());
+// `agentId` records WHOSE screen the base is: a client mirrors one agent at a
+// time, and a diff must never be computed against another agent's lines — on a
+// target switch the mismatch forces a keyframe, which also reseeds the app's
+// buffer (it ignores diffs whose agentId differs from its buffer's).
+function mirrorClientState(): Map<WebSocket, { agentId: string; lines: string[]; width: number; height: number; lastSentAt: number }> {
+  return ((RC as any).mirrorClientState ??= new Map<WebSocket, { agentId: string; lines: string[]; width: number; height: number; lastSentAt: number }>());
 }
 // Per-client minimum interval (ms) before the next frame, scaled by how much data
 // is already queued on its socket. Zero backlog → base rate; grows from there.
@@ -792,24 +815,36 @@ function ensureMirrorPump(): void {
     // so it must stream every frame without deferring — deferring there was
     // freezing peer mirrors. Only the host applies these.
     if (mode === "host") {
-      // While the desktop user is scrolled back into history, skip the phone
-      // render ENTIRELY. pi-tui scrolls by shifting a cached slice (cheap); our
-      // renderMirrorNow() does a full phone-width re-compose that pi-tui itself
-      // flags as O(session length) "would make scrolling crawl" — running it
-      // ~15×/s fights the scroll for the event loop and thrashes the cache.
-      if (((mirrorTui as any)?.scrollSliceStart ?? -1) >= 0) return;
-      // Otherwise, hold off the cache-thrashing phone render while the desktop is
-      // actively rendering — unless the mirror has been stale too long. Leave
-      // mirrorDirty set so the next tick (after the desktop quiets) picks it up.
-      const desktopActive = now - lastDesktopRenderAt < MIRROR_DESKTOP_QUIET_MS;
-      const staleFor = now - lastMirrorSentAt;
-      // While the phone is actively typing it's waiting on each keystroke to echo, so
-      // don't sit on the frame for up to MAX_DEFER ms — but only when renders are cheap
-      // enough that running them at pump cadence won't thrash the event loop (see
-      // MIRROR_INPUT_ACTIVE_MS / MIRROR_CHEAP_RENDER_MS).
-      const phoneTyping = now - lastMirrorInputAt < MIRROR_INPUT_ACTIVE_MS
-        && lastMirrorRenderMs <= MIRROR_CHEAP_RENDER_MS;
-      if (desktopActive && staleFor < MIRROR_MAX_DEFER_MS && !phoneTyping) return;
+      // The scroll-pause and desktop-render defer exist to protect a HUMAN at
+      // the host terminal — and the desktop rendering does NOT imply one is
+      // there: an agent streaming tokens renders continuously with nobody at
+      // the desk, and that is precisely when the phone user is watching. Only
+      // recent LOCAL input proves presence; without it, skip the protection and
+      // run at pump cadence (the measured difference on a large session is
+      // ~2 fps deferred vs render-bound ~7–15 fps).
+      const humanAtDesk = now - lastLocalInputAt < MIRROR_LOCAL_PRESENCE_MS;
+      if (humanAtDesk) {
+        // While the desktop user is scrolled back into history, skip the phone
+        // render ENTIRELY. pi-tui scrolls by shifting a cached slice (cheap); our
+        // renderMirrorNow() does a full phone-width re-compose that pi-tui itself
+        // flags as O(session length) "would make scrolling crawl" — running it
+        // ~15×/s fights the scroll for the event loop and thrashes the cache.
+        // (Inside the presence gate: scrolling IS local input, and gating here
+        // means a session left scrolled-back overnight can't freeze the mirror.)
+        if (((mirrorTui as any)?.scrollSliceStart ?? -1) >= 0) return;
+        // Otherwise, hold off the cache-thrashing phone render while the desktop is
+        // actively rendering — unless the mirror has been stale too long. Leave
+        // mirrorDirty set so the next tick (after the desktop quiets) picks it up.
+        const desktopActive = now - lastDesktopRenderAt < MIRROR_DESKTOP_QUIET_MS;
+        const staleFor = now - lastMirrorSentAt;
+        // While the phone is actively typing it's waiting on each keystroke to echo, so
+        // don't sit on the frame for up to MAX_DEFER ms — but only when renders are cheap
+        // enough that running them at pump cadence won't thrash the event loop (see
+        // MIRROR_INPUT_ACTIVE_MS / MIRROR_CHEAP_RENDER_MS).
+        const phoneTyping = now - lastMirrorInputAt < MIRROR_INPUT_ACTIVE_MS
+          && lastMirrorRenderMs <= MIRROR_CHEAP_RENDER_MS;
+        if (desktopActive && staleFor < MIRROR_MAX_DEFER_MS && !phoneTyping) return;
+      }
       // No point doing the O(session) phone-width render if every viewer is
       // congested and would just drop it — leave mirrorDirty set and wait.
       if (!anyClientCanReceiveMirror()) return;
@@ -860,6 +895,15 @@ function attachMirror(tui: any): void {
   ensureMirrorPump();
   if (tui.__rcMirrorPatched) return;
   tui.__rcMirrorPatched = true;
+
+  // Presence detection: any input that reaches the TUI *not* via
+  // injectMirrorInput came from the local terminal — a human is at the desk.
+  // The pump uses this to decide whether the desktop still needs protecting.
+  const origHandleInput = tui.handleInput.bind(tui);
+  tui.handleInput = (data: string) => {
+    if (!injectingInput) lastLocalInputAt = Date.now();
+    return origHandleInput(data);
+  };
 
   const origDoRender = tui.doRender.bind(tui);
 
@@ -922,9 +966,13 @@ function splitInputEvents(data: string): string[] {
 // Inject keys/taps through the TUI's private input path (runtime-reachable).
 function injectMirrorInput(data: string): void {
   lastMirrorInputAt = Date.now(); // phone is actively driving; pump skips the defer
+  injectingInput = true; // phone input must not read as "human at the desk"
   try {
     for (const ev of splitInputEvents(data)) mirrorTui?.handleInput?.(ev);
-  } catch { /* never crash on remote input */ }
+  } catch { /* never crash on remote input */
+  } finally {
+    injectingInput = false;
+  }
   // Interactive prompts (select lists, AskUserQuestion, the editor) redraw via
   // incremental cursor writes rather than tui.doRender, so the mirror-dirty hook
   // (attachMirror) never fires while you navigate them — the phone goes stale even
@@ -1001,28 +1049,39 @@ function sendMirrorPayload(ws: WebSocket, json: string): void {
   }
 }
 
-function sendFrameToClient(ws: WebSocket): void {
+// One mirror frame, ready to send to a client: whose screen, which seq, and the
+// composed lines. Built from lastMirrorFrame for our own screen, or from a
+// relayed peer payload for a peer's.
+type OutFrame = { agentId: string; seq: number; lines: string[]; cursor: unknown; width: number; height: number };
+
+function selfOutFrame(): OutFrame {
   const f = lastMirrorFrame;
+  return { agentId: SELF_AGENT_ID, seq: mirrorSeq, lines: f.lines, cursor: f.cursor, width: f.width, height: f.height };
+}
+
+function sendFrameToClient(ws: WebSocket, f: OutFrame): void {
   const caps = clientCaps().get(ws);
   const prev = mirrorClientState().get(ws);
-  const canDiff = !!caps?.diff && !!prev && prev.width === f.width && prev.height === f.height;
+  // Diff only against a base of the SAME agent and geometry; anything else
+  // (target switch, resize, first frame) falls back to a keyframe.
+  const canDiff = !!caps?.diff && !!prev && prev.agentId === f.agentId && prev.width === f.width && prev.height === f.height;
   const payload = canDiff
     ? JSON.stringify({
         type: "mirror_diff",
-        agentId: SELF_AGENT_ID,
-        seq: mirrorSeq,
+        agentId: f.agentId,
+        seq: f.seq,
         rows: diffRows(prev!.lines, f.lines),
         lineCount: f.lines.length,
         cursor: f.cursor,
         width: f.width,
         height: f.height,
       })
-    : fullFramePayload();
+    : JSON.stringify({ type: "mirror_frame", agentId: f.agentId, seq: f.seq, lines: f.lines, cursor: f.cursor, width: f.width, height: f.height });
   if (MIRROR_DEBUG) { if (canDiff) mirrorDbgDiffs++; else mirrorDbgKeyframes++; }
   sendMirrorPayload(ws, payload);
   // Copy the lines: the stored base must not alias an array the renderer might
   // reuse/mutate next frame, or diffs would come out empty.
-  mirrorClientState().set(ws, { lines: f.lines.slice(), width: f.width, height: f.height, lastSentAt: Date.now() });
+  mirrorClientState().set(ws, { agentId: f.agentId, lines: f.lines.slice(), width: f.width, height: f.height, lastSentAt: Date.now() });
 }
 
 /** Send OUR screen: to clients mirroring us (host mode) or upstream (peer mode). */
@@ -1038,10 +1097,11 @@ function sendMirrorFrame(only?: WebSocket): void {
     // On-subscribe snapshot: always a full keyframe so a new viewer isn't blank.
     if (only.readyState === 1) {
       sendMirrorPayload(only, fullFramePayload());
-      mirrorClientState().set(only, { lines: lastMirrorFrame.lines.slice(), width: lastMirrorFrame.width, height: lastMirrorFrame.height, lastSentAt: Date.now() });
+      mirrorClientState().set(only, { agentId: SELF_AGENT_ID, lines: lastMirrorFrame.lines.slice(), width: lastMirrorFrame.width, height: lastMirrorFrame.height, lastSentAt: Date.now() });
     }
     return;
   }
+  const f = selfOutFrame();
   const now = Date.now();
   for (const [ws, target] of mirrorTargets()) {
     if (target !== SELF_AGENT_ID || ws.readyState !== 1) continue;
@@ -1052,7 +1112,7 @@ function sendMirrorFrame(only?: WebSocket): void {
     // than its (backlog-scaled) interval allows — smooth degradation on slow links.
     const st = mirrorClientState().get(ws);
     if (st && now - st.lastSentAt < clientSendInterval(buffered)) continue;
-    sendFrameToClient(ws);
+    sendFrameToClient(ws, f);
   }
 }
 
@@ -2382,10 +2442,33 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
       }
       if (payload.type === "mirror_frame") {
         // Screen frames are high-volume and per-viewer: send only to clients
-        // mirroring this peer, not the general broadcast.
-        const framed = JSON.stringify({ ...payload, agentId: sourceAgentId });
+        // mirroring this peer, not the general broadcast — and through the SAME
+        // per-client diff/backpressure/cadence path as our own frames. Relaying
+        // full keyframes blind (the old behavior) cost ~23 KB × ~2 fps ≈ 46 KB/s
+        // per watched peer tab with no queue limit: more than a cell/VPN link
+        // carries, so the socket backlog grew without bound and the viewer
+        // watched an ever-staler screen. Diffed, a peer tab costs what a self
+        // tab costs (~1 KB/s streaming).
+        //
+        // A skipped frame here is not retried (the peer pushes on its own
+        // cadence, and the next frame supersedes it) — same tradeoff as the
+        // self-path drop, with the same "only the newest frame matters" logic.
+        const f: OutFrame = {
+          agentId: sourceAgentId,
+          seq: (payload.seq as number) ?? 0,
+          lines: (payload.lines as string[]) ?? [],
+          cursor: payload.cursor,
+          width: (payload.width as number) ?? 80,
+          height: (payload.height as number) ?? 24,
+        };
+        const nowMs = Date.now();
         for (const [clientWs, target] of mirrorTargets()) {
-          if (target === sourceAgentId && clientWs.readyState === 1) sendMirrorPayload(clientWs, framed);
+          if (target !== sourceAgentId || clientWs.readyState !== 1) continue;
+          const buffered = (clientWs as any).bufferedAmount ?? 0;
+          if (buffered > MIRROR_MAX_BUFFERED) { mirrorDbgDropped++; continue; }
+          const st = mirrorClientState().get(clientWs);
+          if (st && st.agentId === sourceAgentId && nowMs - st.lastSentAt < clientSendInterval(buffered)) continue;
+          sendFrameToClient(clientWs, f);
         }
         break;
       }
