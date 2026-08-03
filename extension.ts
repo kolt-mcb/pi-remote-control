@@ -30,6 +30,14 @@ import fs from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
 import selfsigned from "selfsigned";
+// IMPORTANT: import these, never require() them. pi loads extensions through
+// jiti, and `require("@earendil-works/pi-tui")` returns a SECOND, independent
+// copy of the module — different class objects, and separately-held module
+// state. Anything that depends on identity (patching a prototype) or on shared
+// state (the terminal capability globals) must come from the static import, or
+// it silently talks to a copy nothing else is using. Measured, not theorised:
+// patching the require()d Markdown/Text produced zero cache hits.
+import { getCapabilities, Markdown, setCapabilities, Text as TuiText } from "@earendil-works/pi-tui";
 // Local fork of pi-tui exposes selectListEvents/respondToSelectList so we can
 // surface any SelectList-based selector (built-in or extension) to the phone.
 // These are NOT in upstream pi; provide no-op stubs so the extension loads everywhere.
@@ -49,6 +57,74 @@ if (!selectListEvents) {
 }
 if (!respondToSelectList) {
   respondToSelectList = () => {};
+}
+
+// ── Optional: width-keyed render cache (PI_REMOTE_WIDTH_CACHE=1) ─────────
+// pi-tui's Text and Markdown each cache their rendered lines in ONE slot, keyed
+// on the last width they drew. That is optimal for a terminal, which has one
+// width — but the mirror renders a second time at the phone's width, so the two
+// widths alternate and every single render misses: evict, recompute, repeat.
+// For Markdown that is a full re-parse, and the cost scales with session length
+// rather than with what changed. It is the reason long sessions feel sluggish
+// and desktop scrolling crawls while a phone is attached.
+//
+// The real fix belongs in pi-tui (a small width-keyed LRU instead of one slot),
+// where it sits next to the invalidation calls and is therefore correct by
+// construction. This is the stopgap: wrap the prototypes and memoize per width.
+//
+// OFF BY DEFAULT, and deliberately so. Every other reach-in this extension does
+// fails loudly — a renamed TUI member means a blank mirror, which we report. A
+// missed invalidation here fails QUIETLY AND WRONGLY: stale or garbled text, in
+// the user's own terminal, because patching the prototype changes the desktop
+// render too. Opt in, measure, and prefer the upstream fix.
+const WIDTH_CACHE_MAX = 4;    // desktop + a few distinct client widths
+function addWidthCache(Cls: any): boolean {
+  if (!Cls?.prototype?.render || Cls.prototype.__rcWidthCached) return false;
+  const origRender = Cls.prototype.render;
+  const origInvalidate = Cls.prototype.invalidate;
+  if (typeof origRender !== "function" || typeof origInvalidate !== "function") return false;
+  Cls.prototype.__rcWidthCached = true;
+
+  // A theme change clears the component's own cache without touching its text,
+  // so the guard in render() can't see it — hook the call itself.
+  Cls.prototype.invalidate = function (this: any, ...args: any[]) {
+    this.__rcCache?.clear();
+    return origInvalidate.apply(this, args);
+  };
+
+  Cls.prototype.render = function (this: any, width: number) {
+    const cache: Map<number, string[]> = (this.__rcCache ??= new Map());
+    // Guard on the private fields the output actually depends on. setText() and
+    // setCustomBgFn() both land here without needing hooks of their own.
+    if (this.__rcText !== this.text || this.__rcBg !== this.customBgFn) {
+      cache.clear();
+      this.__rcText = this.text;
+      this.__rcBg = this.customBgFn;
+    }
+    const hit = cache.get(width);
+    if (hit) {
+      cache.delete(width); // re-insert to refresh recency (Map keeps insertion order)
+      cache.set(width, hit);
+      return hit;
+    }
+    const lines = origRender.call(this, width);
+    if (!cache.has(width) && cache.size >= WIDTH_CACHE_MAX) {
+      const oldest = cache.keys().next().value; // least recently used
+      if (oldest !== undefined) cache.delete(oldest);
+    }
+    cache.set(width, lines);
+    return lines;
+  };
+  return true;
+}
+
+if (process.env.PI_REMOTE_WIDTH_CACHE === "1") {
+  try {
+    const patched = [addWidthCache(Markdown), addWidthCache(TuiText)].filter(Boolean).length;
+    console.log(`[pi-remote-control] PI_REMOTE_WIDTH_CACHE=1: width-keyed render cache active on ${patched} pi-tui component(s).`);
+  } catch (e: any) {
+    console.warn(`[pi-remote-control] PI_REMOTE_WIDTH_CACHE=1 requested but patching failed: ${e?.message ?? e}`);
+  }
 }
 // The message/tool components are pi's own interactive-mode renderers — we
 // re-render them headless at the phone's width so the app shows *exactly*
@@ -659,10 +735,12 @@ function renderMirrorNow(): boolean {
     const forceImages = mirrorWantsImages() && width !== termCols;
     let saved: any;
     if (forceImages) {
+      // Must be the imported functions: capabilities are module-level state, and
+      // the require()d copy of pi-tui holds its own. Setting them there left the
+      // copy pi actually renders with untouched, so this whole branch was inert.
       try {
-        const pitui = require("@earendil-works/pi-tui");
-        saved = pitui.getCapabilities();
-        pitui.setCapabilities({ ...saved, images: "kitty" });
+        saved = getCapabilities();
+        setCapabilities({ ...saved, images: "kitty" });
       } catch { saved = undefined; }
     }
     let lines: string[];
@@ -674,7 +752,7 @@ function renderMirrorNow(): boolean {
       dbgOverlay = lines.length;
     } finally {
       if (saved !== undefined) {
-        try { require("@earendil-works/pi-tui").setCapabilities(saved); } catch { /* ignore */ }
+        try { setCapabilities(saved); } catch { /* ignore */ }
       }
     }
     const cursor = tui.extractCursorPosition(lines, height);
@@ -2737,8 +2815,7 @@ export default function (pi: ExtensionAPI) {
   // ── Message renderer ──────────────────────────────────────────────────
 
   pi.registerMessageRenderer("remote", (msg, _opts, theme) => {
-    const { Text } = require("@earendil-works/pi-tui") as typeof import("@earendil-works/pi-tui");
-    return new Text(theme.fg("accent", `[Remote] ${msg.content}`), 0, 0);
+    return new TuiText(theme.fg("accent", `[Remote] ${msg.content}`), 0, 0);
   });
 
   // ── Agent events ─────────────────────────────────────────────────────
