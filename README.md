@@ -43,6 +43,17 @@ protocol is plain WebSocket + JSON, so anything that speaks it can connect.
   telemetry. TLS with a fingerprint-pinned self-signed cert, plus
   shared-secret token auth on every connection.
 
+## Yes, it runs DOOM
+
+<p align="center">
+  <img src="docs/doom-demo.gif" width="320"
+       alt="DOOM running inside a pi session, mirrored to and played from a phone">
+</p>
+
+The mirror is a real terminal, not a chat view — anything pi renders, the
+phone renders. Here that's [pi-doom](https://github.com/badlogic/pi-doom)
+running in a session tab, played from the phone's terminal keyboard.
+
 ## Quick start
 
 **1 — Install the extension** on the machine running pi:
