@@ -1,4 +1,4 @@
-<h1 align="center">Pi Remote Control</h1>
+<h1 align="center">Pocket Pi</h1>
 
 <p align="center"><b>Your <a href="https://github.com/earendil-works/pi">pi</a> session, live on your phone.</b><br>
 The full terminal — streamed, interactive, end-to-end encrypted, LAN-only.</p>
@@ -6,7 +6,7 @@ The full terminal — streamed, interactive, end-to-end encrypted, LAN-only.</p>
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/pi-package-8A2BE2" alt="pi package">
-  <a href="https://github.com/kolt-mcb/pi-remote-control-app"><img src="https://img.shields.io/badge/client-Android-3DDC84" alt="Android client"></a>
+  <a href="https://github.com/kolt-mcb/pocket-pi-app"><img src="https://img.shields.io/badge/client-Android-3DDC84" alt="Android client"></a>
 </p>
 
 <p align="center">
@@ -14,11 +14,11 @@ The full terminal — streamed, interactive, end-to-end encrypted, LAN-only.</p>
        alt="A live pi session mirrored on a phone: streaming agent output, session tabs, terminal keyboard">
 </p>
 
-Pi Remote Control shows your live pi terminal on your phone and lets you
+Pocket Pi shows your live pi terminal on your phone and lets you
 type back. Everything works exactly like it does at your desk — menus,
 pickers, slash commands — resized to fit your phone's screen. Setup is one
 install command and one QR scan. The phone app is
-[pi-remote-control-app](https://github.com/kolt-mcb/pi-remote-control-app);
+[pocket-pi-app](https://github.com/kolt-mcb/pocket-pi-app);
 under the hood it's plain WebSocket + JSON, so other clients can connect
 too.
 
@@ -57,7 +57,7 @@ running in a session tab, played from the phone's terminal keyboard.
 **1 — Install the extension** on the machine running pi:
 
 ```bash
-pi install git:github.com/kolt-mcb/pi-remote-control
+pi install git:github.com/kolt-mcb/pocket-pi
 ```
 
 **2 — Launch `pi`.** The server starts with the session and prints its URL
@@ -65,7 +65,7 @@ and a pairing QR code (re-show it anytime with `/remote-qr`, stop the server
 with `/remote-stop`):
 
 ```
-┌─ Pi Remote Control (host) ───────────────────────────────────────────┐
+┌─ Pocket Pi (host) ────────────────────────────────────────────────────┐
 │  wss://192.168.1.42:8765/?token=…32hex…&fp=…64hex…                   │
 └──────────────────────────────────────────────────────────────────────┘
   auth: shared-secret token from /home/you/.pi/agent/pi-remote-control.token
@@ -74,11 +74,11 @@ with `/remote-stop`):
 ```
 
 **3 — Pair your phone.** Install the
-[Android app](https://github.com/kolt-mcb/pi-remote-control-app/releases)
+[Android app](https://github.com/kolt-mcb/pocket-pi-app/releases)
 and scan the QR. The QR carries the address, the auth token, and the TLS
 fingerprint the app pins — one scan does the whole setup.
 
-To update later: `pi update git:github.com/kolt-mcb/pi-remote-control`, then
+To update later: `pi update git:github.com/kolt-mcb/pocket-pi`, then
 restart pi.
 
 ## Configuration
@@ -168,7 +168,7 @@ for host→client).
 ## Development
 
 ```bash
-git clone https://github.com/kolt-mcb/pi-remote-control
+git clone https://github.com/kolt-mcb/pocket-pi
 cd pi-remote-control
 npm install
 pi -e ./extension.ts   # load the extension directly for this run

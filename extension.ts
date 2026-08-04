@@ -1,5 +1,5 @@
 /**
- * Pi Remote Control Extension
+ * Pocket Pi Extension
  *
  * Drives a pi session from a phone. Starts a TLS WebSocket server inside pi
  * (no separate process), prints a QR code carrying the URL + auth token +
@@ -105,9 +105,9 @@ function addWidthCache(Cls: any): boolean {
 if (process.env.PI_REMOTE_WIDTH_CACHE === "1") {
   try {
     const patched = [addWidthCache(Markdown), addWidthCache(TuiText)].filter(Boolean).length;
-    console.log(`[pi-remote-control] PI_REMOTE_WIDTH_CACHE=1: width-keyed render cache active on ${patched} pi-tui component(s).`);
+    console.log(`[pocket-pi] PI_REMOTE_WIDTH_CACHE=1: width-keyed render cache active on ${patched} pi-tui component(s).`);
   } catch (e: any) {
-    console.warn(`[pi-remote-control] PI_REMOTE_WIDTH_CACHE=1 requested but patching failed: ${e?.message ?? e}`);
+    console.warn(`[pocket-pi] PI_REMOTE_WIDTH_CACHE=1 requested but patching failed: ${e?.message ?? e}`);
   }
 }
 // The message/tool components are pi's own interactive-mode renderers — we
@@ -832,9 +832,9 @@ function attachMirror(tui: any): void {
   const missing = missingTuiMembers(tui);
   if (missing.length > 0) {
     console.warn(
-      `[pi-remote-control] screen mirror disabled: this pi build's TUI is missing ${missing.join(", ")}.\n` +
+      `[pocket-pi] screen mirror disabled: this pi build's TUI is missing ${missing.join(", ")}.\n` +
       `  The mirror drives pi's own renderer through internals that pi may rename at any time.\n` +
-      `  Please report the pi version at https://github.com/kolt-mcb/pi-remote-control/issues — phones will connect but show nothing.`,
+      `  Please report the pi version at https://github.com/kolt-mcb/pocket-pi/issues — phones will connect but show nothing.`,
     );
     return; // leave mirrorTui null: no half-attached state, no pump
   }
@@ -1837,7 +1837,7 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
     // Banner shows only the compact base address so the box stays narrow and
     // survives split/narrow terminals; the full URL (with token + fingerprint)
     // is printed under the QR by printQrBlock below.
-    console.log("\n" + box("Pi Remote Control (host)", [`wss://${ip}:${DEFAULT_PORT}`]).join("\n"));
+    console.log("\n" + box("Pocket Pi (host)", [`wss://${ip}:${DEFAULT_PORT}`]).join("\n"));
     // Honest one-line summary of the auth state so the user knows what's
     // protecting (or not protecting) their pi.
     switch (AUTH_TOKEN_SOURCE) {
@@ -2093,7 +2093,7 @@ function stop(pi: ExtensionAPI): void {
   localMessageCount = 0;
   localTurnIndex = 0;
   refreshRemoteStatus(); // mode is "stopped" → clears the footer chip
-  console.log("[pi-remote-control] stopped");
+  console.log("[pocket-pi] stopped");
 }
 
 // ── /resume picker (text render-frame) ──────────────────────────────
@@ -2695,7 +2695,7 @@ export default function (pi: ExtensionAPI) {
   // mirroring then degrades to plain text — see the rendered-presentation bridge).
   piApi = pi;
   if (typeof (pi as any).getMessageRenderer !== "function") {
-    console.log("[pi-remote-control] note: pi build does not expose getMessageRenderer/getToolDefinition — extension presentation mirroring disabled (text fallback).");
+    console.log("[pocket-pi] note: pi build does not expose getMessageRenderer/getToolDefinition — extension presentation mirroring disabled (text fallback).");
   }
 
   // ── Tools ─────────────────────────────────────────────────────────────

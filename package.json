@@ -1,12 +1,12 @@
 {
-  "name": "pi-remote-control",
+  "name": "pocket-pi",
   "version": "0.1.0",
-  "description": "Pi extension for LAN remote control from phone — connect via Android app over WebSocket",
+  "description": "Your pi session, live on your phone — full terminal mirror over LAN WebSocket",
   "type": "module",
-  "homepage": "https://github.com/kolt-mcb/pi-remote-control",
+  "homepage": "https://github.com/kolt-mcb/pocket-pi",
   "repository": {
     "type": "git",
-    "url": "https://github.com/kolt-mcb/pi-remote-control.git"
+    "url": "https://github.com/kolt-mcb/pocket-pi.git"
   },
   "keywords": [
     "pi",
