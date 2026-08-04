@@ -325,6 +325,9 @@ const clientConns = RC.clientConns; // Android viewers only
 const peerConns = RC.peerConns; // peer agentId -> ws
 const wsToPeerId = RC.wsToPeerId;
 const peerPids = RC.peerPids; // peer agentId -> pid (for killing)
+// Reconstructed full frame per peer, so upstream row-diffs (peer_ack
+// relayDiff) can be re-expanded before per-client relay diffing.
+const peerFrameBases = new Map<string, { lines: string[]; width: number; height: number }>();
 const agents = RC.agents; // includes self + peers
 
 // Peer-mode state
@@ -636,6 +639,11 @@ function mirrorDebugAccount(bytes: number): void {
 }
 // Peer mode: the host asked us to stream our screen upstream (route_mirror).
 let peerMirrorOn = false;
+// Peer mode: host advertised relayDiff in peer_ack — it reconstructs row-diffs,
+// so upstream frames can be diffs against what we last sent instead of full
+// keyframes (~60× less for the host to parse while a peer tab streams).
+let hostRelayDiff = false;
+let lastUpstreamFrame: { lines: string[]; width: number; height: number } | null = null;
 // Peer mode: a viewer downstream wants real images, so render kitty graphics.
 let peerWantsImages = false;
 // Peer mode: how many phones are connected to our host (peers have no direct
@@ -798,6 +806,13 @@ function ensureMirrorPump(): void {
       // congested and would just drop it — leave mirrorDirty set and wait.
       if (!anyClientCanReceiveMirror()) return;
     }
+    // Duty-cycle cap (host and peer): when phone-width renders are expensive
+    // (very large sessions), running one every tick back-to-back saturates the
+    // event loop — new TLS handshakes and peer joins then stall for seconds.
+    // Space renders to at least 2× their own cost so the loop always keeps
+    // ≥50% headroom. Cheap renders are unaffected (fps unchanged).
+    if (lastMirrorRenderMs > MIRROR_CHEAP_RENDER_MS
+        && now - lastMirrorSentAt < lastMirrorRenderMs * 2) return;
     mirrorDirty = false;
     if (renderMirrorNow()) { sendMirrorFrame(); lastMirrorSentAt = now; }
   }, MIRROR_FRAME_MS);
@@ -971,6 +986,28 @@ function mirrorFramePayload(): Record<string, unknown> {
   };
 }
 
+// Peer-mode upstream payload: a row-diff against what we last sent when the
+// host reconstructs diffs (peer_ack relayDiff), else a full keyframe. The host
+// re-diffs per client anyway; this only shrinks the peer→host hop.
+function upstreamFramePayload(): Record<string, unknown> {
+  const f = lastMirrorFrame;
+  const canDiff = hostRelayDiff && lastUpstreamFrame
+    && lastUpstreamFrame.width === f.width && lastUpstreamFrame.height === f.height;
+  const payload = canDiff
+    ? {
+        type: "mirror_diff",
+        seq: mirrorSeq,
+        rows: diffRows(lastUpstreamFrame!.lines, f.lines),
+        lineCount: f.lines.length,
+        cursor: f.cursor,
+        width: f.width,
+        height: f.height,
+      }
+    : mirrorFramePayload();
+  lastUpstreamFrame = { lines: f.lines.slice(), width: f.width, height: f.height };
+  return payload;
+}
+
 /** Full-frame (keyframe) payload string for a self-agent client. */
 function fullFramePayload(): string {
   return JSON.stringify({ ...mirrorFramePayload(), agentId: SELF_AGENT_ID });
@@ -1035,7 +1072,7 @@ function sendMirrorFrame(only?: WebSocket): void {
   if (!lastMirrorFrame && !renderMirrorNow()) return; // ensure a frame exists
   if (mode === "peer") {
     if (peerMirrorOn && peerSock?.readyState === 1) {
-      peerSock.send(JSON.stringify({ type: "peer_event", agentId: SELF_AGENT_ID, payload: mirrorFramePayload() }));
+      peerSock.send(JSON.stringify({ type: "peer_event", agentId: SELF_AGENT_ID, payload: upstreamFramePayload() }));
     }
     return;
   }
@@ -1920,6 +1957,7 @@ function startHost(pi: ExtensionAPI, onBindFail: () => void): void {
         peerConns.delete(peerId);
         agents.delete(peerId);
         peerPids.delete(peerId);
+        peerFrameBases.delete(peerId);
         wsToPeerId.delete(ws);
       } else {
         clientConns.delete(ws);
@@ -2354,7 +2392,15 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
         turnIndex: 0,
         pid: peerPid ?? undefined,
       });
-      ws.send(JSON.stringify({ type: "peer_ack", hostAgentId: SELF_AGENT_ID, clients: clientConns.size }));
+      // Peers never render chat history — cancel the deferred replay a plain
+      // client would get. Rendering a long session's scrollback is seconds of
+      // synchronous work on this loop, and it fired on EVERY peer (re)join,
+      // which is exactly when the host most needs to stay responsive.
+      const pendingHist = pendingHistory().get(ws);
+      if (pendingHist) { clearTimeout(pendingHist); pendingHistory().delete(ws); }
+      // relayDiff: this host reconstructs upstream row-diffs (see peer_event),
+      // so the peer may diff its frames instead of sending full keyframes.
+      ws.send(JSON.stringify({ type: "peer_ack", hostAgentId: SELF_AGENT_ID, clients: clientConns.size, relayDiff: true }));
       refreshRemoteStatus();
       hostBcastSessionList();
       break;
@@ -2376,7 +2422,7 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
           agent.turnIndex = payload.turnIndex;
         }
       }
-      if (payload.type === "mirror_frame") {
+      if (payload.type === "mirror_frame" || payload.type === "mirror_diff") {
         // Screen frames are high-volume and per-viewer: send only to clients
         // mirroring this peer, not the general broadcast — and through the SAME
         // per-client diff/backpressure/cadence path as our own frames. Relaying
@@ -2389,13 +2435,39 @@ function handleHostCmd(cmd: Record<string, unknown>, pi: ExtensionAPI, ws: WebSo
         // A skipped frame here is not retried (the peer pushes on its own
         // cadence, and the next frame supersedes it) — same tradeoff as the
         // self-path drop, with the same "only the newest frame matters" logic.
+        // Peers send keyframes OR row-diffs against their previous upstream
+        // frame (peer_ack relayDiff). Keep one reconstructed full frame per
+        // peer so diffs re-expand here, then re-diff per client as usual.
+        const pWidth = (payload.width as number) ?? 80;
+        const pHeight = (payload.height as number) ?? 24;
+        let pLines: string[];
+        if (payload.type === "mirror_frame") {
+          pLines = (payload.lines as string[]) ?? [];
+        } else {
+          const base = peerFrameBases.get(sourceAgentId);
+          if (!base || base.width !== pWidth || base.height !== pHeight) {
+            // No base to apply this diff to (host restarted, geometry changed,
+            // or we joined mid-stream): ask the peer for a keyframe and drop it.
+            if (ws.readyState === 1) ws.send(JSON.stringify({ type: "route_mirror_resync" }));
+            break;
+          }
+          pLines = base.lines;
+          const rows = (payload.rows as Array<{ i: number; t: string }>) ?? [];
+          const lineCount = (payload.lineCount as number) ?? pLines.length;
+          pLines.length = lineCount;
+          for (let k = 0; k < lineCount; k++) if (pLines[k] === undefined) pLines[k] = "";
+          for (const r of rows) {
+            if (r && typeof r.i === "number" && r.i >= 0 && r.i < lineCount) pLines[r.i] = String(r.t ?? "");
+          }
+        }
+        peerFrameBases.set(sourceAgentId, { lines: pLines, width: pWidth, height: pHeight });
         const f: OutFrame = {
           agentId: sourceAgentId,
           seq: (payload.seq as number) ?? 0,
-          lines: (payload.lines as string[]) ?? [],
+          lines: pLines,
           cursor: payload.cursor,
-          width: (payload.width as number) ?? 80,
-          height: (payload.height as number) ?? 24,
+          width: pWidth,
+          height: pHeight,
         };
         const nowMs = Date.now();
         for (const [clientWs, target] of mirrorTargets()) {
@@ -2666,6 +2738,9 @@ function handlePeerInbound(msg: Record<string, unknown>, pi: ExtensionAPI): void
       const cols = Number(msg.cols);
       if (peerMirrorOn && Number.isFinite(cols)) clientCols = Math.max(20, Math.min(400, Math.floor(cols)));
       requestMirrorFrame(); // render at the phone width (or revert)
+      // Fresh subscription: start from a keyframe so the host relay (and any
+      // just-switched viewer) has a base to diff against.
+      lastUpstreamFrame = null;
       if (peerMirrorOn) sendMirrorFrame(); // immediate snapshot upstream
       break;
     }
@@ -2680,6 +2755,13 @@ function handlePeerInbound(msg: Record<string, unknown>, pi: ExtensionAPI): void
     case "host_clients": {
       // Host tells us how many phones are connected (so file delivery can gate).
       if (typeof msg.clients === "number") hostClientCount = msg.clients;
+      if (msg.type === "peer_ack") hostRelayDiff = msg.relayDiff === true;
+      break;
+    }
+    case "route_mirror_resync": {
+      // Host lost (or never had) our frame base — restart from a keyframe.
+      lastUpstreamFrame = null;
+      if (peerMirrorOn) sendMirrorFrame();
       break;
     }
     // any other host->peer messages: ignored (no state to update)
