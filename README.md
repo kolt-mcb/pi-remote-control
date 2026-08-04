@@ -14,34 +14,32 @@ The full terminal — streamed, interactive, end-to-end encrypted, LAN-only.</p>
        alt="A live pi session mirrored on a phone: streaming agent output, session tabs, terminal keyboard">
 </p>
 
-Pi Remote Control is a pi extension that runs a TLS WebSocket server inside
-your pi process and mirrors the live terminal UI to any connected client —
-re-rendered server-side to fit the client's screen. Keystrokes flow back
-through pi's own input path, so menus, pickers, and slash commands work
-exactly as they do at the desk. The reference client is the
-[Android app](https://github.com/kolt-mcb/pi-remote-control-app); the
-protocol is plain WebSocket + JSON, so anything that speaks it can connect.
+Pi Remote Control shows your live pi terminal on your phone and lets you
+type back. Everything works exactly like it does at your desk — menus,
+pickers, slash commands — resized to fit your phone's screen. Setup is one
+install command and one QR scan. The phone app is
+[pi-remote-control-app](https://github.com/kolt-mcb/pi-remote-control-app);
+under the hood it's plain WebSocket + JSON, so other clients can connect
+too.
 
 ## Features
 
-- **Full terminal mirror** — everything that renders in your terminal
-  renders on the phone: messages, menus, overlays, spinners, colors. Frames
-  are row-diffed and deflate-compressed (~1 KB/s steady state; tested down
-  to 30 KB/s links).
-- **Remote input** — a terminal keyboard on the client injects keystrokes
-  into pi's input path. Typing `/` opens pi's own command menu in the mirror.
-- **Multi-session** — additional pi instances on the same machine join as
-  peers on the same port. Clients can view, drive, and spawn sessions in any
-  directory.
-- **History replay** — connecting clients receive the whole conversation,
-  not just events from that point on.
-- **File & image delivery** — the agent can push files to the phone
-  (`send_file_to_phone`) and display images inline in the mirror
-  (`show_image_to_phone`), even when the host terminal can't render them.
-- **Theme mirroring** — clients receive pi's active palette and match it.
-- **Private by design** — LAN-only, no cloud relay, no accounts, no
-  telemetry. TLS with a fingerprint-pinned self-signed cert, plus
-  shared-secret token auth on every connection.
+- **Your real terminal, live** — everything that shows in your terminal
+  shows on the phone: messages, menus, spinners, colors.
+- **Type from anywhere** — a terminal keyboard on the phone; typing `/`
+  opens pi's own command menu, just like at the desk.
+- **Every session, one screen** — all the pi instances on your machine
+  appear as tabs. Switch, drive, or start new ones in any folder.
+- **Never miss context** — connecting mid-conversation shows the whole
+  conversation, not just what happens next.
+- **Files and images** — the agent can send files straight to your phone
+  and show images right in the mirror, even when your terminal can't
+  display them.
+- **Matches your theme** — the phone picks up your pi color scheme.
+- **Light on data** — about 1 KB/s while the agent streams; stays smooth
+  even on a weak cell connection.
+- **Private by design** — your phone talks only to your machine, on your
+  network. Encrypted end to end, no cloud, no accounts, no telemetry.
 
 ## Yes, it runs DOOM
 
@@ -85,16 +83,24 @@ restart pi.
 
 ## Configuration
 
-Configured entirely through environment variables on the host:
+Works out of the box; environment variables on the host tweak it:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `PI_REMOTE_PORT` | `8765` | WS server port. A second pi finding the port busy joins as a peer instead. |
-| `PI_REMOTE_TOKEN` | — | Supply your own auth token (e.g. from a password manager). Wins over the persisted file. |
-| `PI_REMOTE_CONTROL_NO_AUTH` | — | `1` disables token auth. **Only safe on networks you fully trust.** The startup banner warns loudly. |
-| `PI_REMOTE_CONTROL_NO_AUTOSTART` | — | `1` disables the automatic server start; run `/remote-control` manually. |
-| `PI_REMOTE_WIDTH_CACHE` | — | `1` enables a width-keyed render cache on pi-tui's text components. The mirror renders each frame a second time at the client's width; the cache stops the two widths from evicting each other. ~2× on render cost for long sessions. |
+| `PI_REMOTE_PORT` | `8765` | The port the phone connects to. A second pi that finds the port busy joins the first as an extra session. |
+| `PI_REMOTE_TOKEN` | — | Use your own access token instead of the generated one. |
+| `PI_REMOTE_CONTROL_NO_AUTH` | — | `1` turns off token auth. **Only on networks you fully trust.** |
+| `PI_REMOTE_CONTROL_NO_AUTOSTART` | — | `1` stops the server from starting automatically; run `/remote-control` when you want it. |
+
+<details>
+<summary><b>Advanced</b></summary>
+
+| Variable | Default | Effect |
+|---|---|---|
+| `PI_REMOTE_WIDTH_CACHE` | — | `1` enables a width-keyed render cache on pi-tui's text components. The mirror renders each frame a second time at the phone's width; the cache stops the two widths from evicting each other's single cache slot. Roughly halves render cost on long sessions. |
 | `PI_REMOTE_DEBUG` | — | `1` prints per-second mirror render/throughput counters. |
+
+</details>
 
 ## Security
 
